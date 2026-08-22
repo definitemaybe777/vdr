@@ -229,7 +229,6 @@ pub fn process_core_dump(
           bytes_in,
           bytes_out = compressed_size,
           build_id = ?build_id,
-          cmdline = ?cmdline,
           comm = ?comm,
           core_limit = metadata.core_limit,
           dumpable = metadata.dumpable,
