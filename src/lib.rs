@@ -17,6 +17,7 @@ use tracing::{info, warn};
 pub const ZSTD_LEVEL: i32 = 3;
 pub const STORAGE_DIR: &str = "/var/lib/vdr";
 pub const MAX_CORE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+const MAX_EXE_SIZE: u64 = 64 * 1024 * 1024; // 64 MB — skip build ID for larger executables
 
 /// Metadata about the crash, provided by the kernel.
 ///
@@ -338,6 +339,17 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
 ///
 /// TODO: Use ElfStream instead of reading the entire file into memory.
 pub(crate) fn parse_executable_build_id(path: &str) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_EXE_SIZE {
+        warn!(
+            path = %path,
+            size = metadata.len(),
+              max = MAX_EXE_SIZE,
+              "executable too large, skipping build ID extraction"
+        );
+        return None;
+    }
+
     let data = std::fs::read(path).ok()?;
 
     let file = match ElfBytes::<AnyEndian>::minimal_parse(&data) {
