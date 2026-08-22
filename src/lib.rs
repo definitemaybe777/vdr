@@ -327,11 +327,16 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
 /// Core dumps (ET_CORE) do not contain a .note.gnu.build-id section;
 /// the build ID lives in the executable itself.
 ///
-/// The executable is a trusted input (root-owned system file on disk),
-/// unlike the core dump which contains attacker-controlled memory.
+/// The executable may be attacker-controlled — users can crash their
+/// own binaries. However, elf crate 0.8 is pure safe Rust (zero unsafe)
+/// and designed to handle untrusted input, returning ParseError rather
+/// than panicking on malformed data. Build ID extraction failure safely
+/// degrades to None.
+///
+/// File size is capped at MAX_EXE_SIZE to avoid loading large executables
+/// (e.g., static Go binaries can be 80+ MB) into memory.
 ///
 /// TODO: Use ElfStream instead of reading the entire file into memory.
-/// Most executables are small, but static Go binaries can be 50+ MB.
 pub(crate) fn parse_executable_build_id(path: &str) -> Option<String> {
     let data = std::fs::read(path).ok()?;
 
