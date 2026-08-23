@@ -119,7 +119,7 @@ pub fn process_core_dump(
         uid = metadata.uid,
         gid = metadata.gid,
         signal = metadata.signal,
-        exe = %metadata.exe_path,
+        exe = ?metadata.exe_path,
         "received core dump"
     );
 
