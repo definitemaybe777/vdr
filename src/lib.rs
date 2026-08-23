@@ -336,7 +336,9 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
 ///
 /// TODO: Use ElfStream instead of reading the entire file into memory.
 pub(crate) fn parse_executable_build_id(path: &str) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
+    // Open once and fstat the same fd — avoids TOCTOU between stat and read.
+    let mut file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
     if metadata.len() > MAX_EXE_SIZE {
         warn!(
             path = %path,
@@ -347,7 +349,10 @@ pub(crate) fn parse_executable_build_id(path: &str) -> Option<String> {
         return None;
     }
 
-    let data = std::fs::read(path).ok()?;
+    // Defense-in-depth: limit read size even if the file grew between
+    // fstat and read.
+    let mut data = Vec::new();
+    file.take(MAX_EXE_SIZE + 1).read_to_end(&mut data).ok()?;
 
     let file = match ElfBytes::<AnyEndian>::minimal_parse(&data) {
         Ok(f) => f,
