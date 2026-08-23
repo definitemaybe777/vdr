@@ -5,3 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+signal-hook = "0.4"
