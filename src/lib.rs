@@ -239,6 +239,10 @@ pub fn process_core_dump(
 
     let compressed_size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
 
+    // cmdline is deliberately not logged: argv may embed secrets
+    // (tokens, URLs with credentials). If logging is ever re-enabled,
+    // use an allowlist of known-safe fields only — never a denylist
+    // of secret-looking patterns.
     info!(
         path = %final_path.display(),
           bytes_in,
