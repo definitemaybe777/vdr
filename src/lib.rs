@@ -12,7 +12,7 @@ use anyhow::Context;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::note::{Note, NoteGnuBuildId};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub const ZSTD_LEVEL: i32 = 3;
 pub const STORAGE_DIR: &str = "/var/lib/vdr";
@@ -315,7 +315,7 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
             }
         }
         Err(e) => {
-            warn!(path = %path, error = %e, "failed to read /proc entry");
+            debug!(path = %path, error = %e, "failed to read /proc entry");
             None
         }
     }
