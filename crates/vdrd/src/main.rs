@@ -1,18 +1,21 @@
 // vdrd: coredump socket daemon.
 // Skeleton: bind, accept, log. Core processing begins in Feature #7.
+//
+// Socket mode: @/run/vdr/coredump.sock (simple mode, no request/ack).
+// The @@ request/ack protocol is deferred to Feature #7.
 
 #![deny(unsafe_code)]
 
 mod ffi;
 
 use std::fs::{self, OpenOptions, Permissions};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use tracing::{error, info, warn};
@@ -33,7 +36,10 @@ fn main() -> Result<()> {
     let shutdown = register_signals()?;
 
     create_socket_dir()?;
+    verify_dir_perms(SOCKET_DIR)?;
+
     let listener = bind_socket()?;
+    verify_socket_perms(SOCKET_PATH)?;
 
     info!(path = SOCKET_PATH, "vdrd listening");
 
@@ -77,7 +83,25 @@ fn create_socket_dir() -> Result<()> {
     Ok(())
 }
 
+fn verify_dir_perms(path: &str) -> Result<()> {
+    let meta = fs::metadata(path).with_context(|| format!("failed to stat directory {}", path))?;
+    let mode = meta.mode() & 0o777;
+    let uid = meta.uid();
+    let gid = meta.gid();
+    if mode != 0o700 || uid != 0 || gid != 0 {
+        bail!(
+            "directory {} has mode {:o}, owner {}:{}, expected 0700 root:root",
+            path,
+            mode,
+            uid,
+            gid
+        );
+    }
+    Ok(())
+}
+
 fn bind_socket() -> Result<UnixListener> {
+    // Remove stale socket file from a previous run.
     let _ = fs::remove_file(SOCKET_PATH);
 
     // umask 0177 makes bind() create the socket file at 0600,
@@ -95,6 +119,23 @@ fn bind_socket() -> Result<UnixListener> {
     fs::set_permissions(SOCKET_PATH, Permissions::from_mode(0o600))
         .with_context(|| format!("failed to set permissions on {}", SOCKET_PATH))?;
     Ok(listener)
+}
+
+fn verify_socket_perms(path: &str) -> Result<()> {
+    let meta = fs::metadata(path).with_context(|| format!("failed to stat socket {}", path))?;
+    let mode = meta.mode() & 0o777;
+    let uid = meta.uid();
+    let gid = meta.gid();
+    if mode != 0o600 || uid != 0 || gid != 0 {
+        bail!(
+            "socket {} has mode {:o}, owner {}:{}, expected 0600 root:root",
+            path,
+            mode,
+            uid,
+            gid
+        );
+    }
+    Ok(())
 }
 
 fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
