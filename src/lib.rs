@@ -216,10 +216,11 @@ pub fn process_core_dump(
 
     // fsync parent directory — rename updates a directory entry,
     // which is separate from the file data already fsync'd.
-    let dir = std::fs::File::open(&storage.storage_dir)
-        .with_context(|| "opening storage dir for fsync")?;
-    dir.sync_all()
-        .with_context(|| "fsync of storage directory")?;
+    // Best-effort: if this fails, the file is already renamed and
+    // data is on disk. Only crash recovery visibility is affected.
+    if let Err(e) = std::fs::File::open(&storage.storage_dir).and_then(|dir| dir.sync_all()) {
+        warn!(error = %e, "failed to fsync storage directory");
+    }
 
     // Everything committed — disarm the guard.
     guard.disarm();
