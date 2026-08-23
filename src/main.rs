@@ -37,13 +37,14 @@ struct Args {
     /// %E — Path of the executable (slashes replaced with '!' by kernel since Linux 3.0)
     executable: String,
 
-    /// %c — Core file size limit (RLIMIT_CORE)
+    /// %c — Core file size limit (RLIMIT_CORE).
+    /// The kernel ignores this for pipe mode; informational only.
     #[arg(default_value_t = 0)]
     core_limit: u64,
 
     /// %d — Dumpable flag (controls whether SUID processes dump).
-    /// CVE-2022-4415 was systemd-coredump failing to honor this.
-    /// Kernel checks this before invoking the handler; logged for audit.
+    /// See CVE-2022-4415. The kernel checks this before invoking the
+    /// handler; logged for audit.
     #[arg(default_value_t = 0)]
     dumpable: u32,
 }

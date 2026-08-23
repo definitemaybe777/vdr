@@ -49,7 +49,7 @@ pub struct CrashMetadata {
     /// %c — Core file size limit (RLIMIT_CORE)
     pub core_limit: u64,
 
-    /// %d — Dumpable flag (CVE-2022-4415 was systemd-coredump failing to honor this)
+    /// %d — Dumpable flag. See CVE-2022-4415.
     pub dumpable: u32,
 }
 
@@ -100,9 +100,8 @@ pub struct StoredDump {
 
 /// Process a core dump from any Read source.
 ///
-/// This is the shared core logic called by both:
-///   - vdr (pipe handler): reads from stdin
-///   - vdrd (socket daemon): reads from UnixStream
+/// Shared core logic. Currently called by vdr (pipe handler, reads
+/// from stdin). vdrd (socket daemon) is planned for v0.2.
 ///
 /// Steps:
 ///   1. Extract build ID from the executable file
@@ -126,9 +125,9 @@ pub fn process_core_dump(
 
     // Build ID lives in the executable's .note.gnu.build-id section,
     // not in the core dump. Core dumps (ET_CORE) have no section
-    // header table. The executable is a trusted input (system file
-    // on disk), unlike the core dump which contains attacker-
-    // controlled memory.
+    // header table. The executable may be attacker-controlled (users
+    // can crash their own binaries), but elf crate 0.8 is pure safe
+    // Rust and handles untrusted input safely.
     let build_id = parse_executable_build_id(&metadata.exe_path);
 
     // Best-effort: the crashed process's /proc entry disappears
@@ -246,11 +245,7 @@ pub fn process_core_dump(
     })
 }
 
-/// RAII guard that removes a temp file on drop unless disarmed.
-///
-/// Ensures temp files are cleaned up if any step between creation
-/// and atomic rename fails. Temp files leak on every failed crash
-/// handling; without cleanup, they accumulate and fill the disk.
+/// Removes a temp file on drop unless disarmed.
 struct TempGuard {
     path: PathBuf,
     armed: bool,
@@ -330,8 +325,7 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
 /// The executable may be attacker-controlled — users can crash their
 /// own binaries. However, elf crate 0.8 is pure safe Rust (zero unsafe)
 /// and designed to handle untrusted input, returning ParseError rather
-/// than panicking on malformed data. Build ID extraction failure safely
-/// degrades to None.
+/// than panicking on malformed data. Returns None on any parse failure.
 ///
 /// File size is capped at MAX_EXE_SIZE to avoid loading large executables
 /// (e.g., static Go binaries can be 80+ MB) into memory.
