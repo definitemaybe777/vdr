@@ -3,6 +3,8 @@
 
 #![deny(unsafe_code)]
 
+mod ffi;
+
 use std::fs::{self, OpenOptions, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -13,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const SOCKET_DIR: &str = "/run/vdr";
 const SOCKET_PATH: &str = "/run/vdr/coredump.sock";
@@ -21,6 +23,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> Result<()> {
     init_logging();
+
+    // Prevent core-dump recursion: if vdrd crashes, do not send
+    // our own core back to the coredump socket.
+    if let Err(e) = ffi::disable_core_dump() {
+        warn!(error = %e, "failed to disable core dump for vdrd; recursion protection may be inactive");
+    }
+
     let shutdown = register_signals()?;
 
     create_socket_dir()?;
@@ -71,11 +80,18 @@ fn create_socket_dir() -> Result<()> {
 }
 
 fn bind_socket() -> Result<UnixListener> {
-    // Remove stale socket file from a previous run.
     let _ = fs::remove_file(SOCKET_PATH);
+
+    // umask 0177 makes bind() create the socket file at 0600,
+    // eliminating the bind → set_permissions race window.
+    // Process-global; vdrd is single-threaded here.
+    let old_umask = ffi::set_umask(0o177);
 
     let listener = UnixListener::bind(SOCKET_PATH)
     .with_context(|| format!("failed to bind socket {}", SOCKET_PATH))?;
+
+    ffi::set_umask(old_umask);
+
     listener
     .set_nonblocking(true)
     .context("failed to set socket non-blocking")?;
@@ -88,7 +104,7 @@ fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((_stream, addr)) => {
-                info!(peer = ?addr, "connection received");
+                info!(peer = ?addr, "connection received (skeleton: core discarded)");
                 // Stream is dropped at end of arm; no processing in skeleton.
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

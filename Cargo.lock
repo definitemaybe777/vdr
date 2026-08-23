@@ -476,6 +476,7 @@ name = "vdrd"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "libc",
  "signal-hook",
  "tracing",
  "tracing-subscriber",
