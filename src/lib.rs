@@ -114,12 +114,17 @@ pub fn process_core_dump(
     metadata: &CrashMetadata,
     storage: &StorageConfig,
 ) -> anyhow::Result<StoredDump> {
+    // /dev/kmsg drops lines exceeding 1024 bytes entirely (returns
+    // EINVAL, not truncated). exe_path is attacker-controlled and can
+    // approach 4096 bytes. Truncate to keep the log line within bounds.
+    let exe_log = truncate_for_log(&metadata.exe_path, 256);
+
     info!(
         pid = metadata.pid,
         uid = metadata.uid,
         gid = metadata.gid,
         signal = metadata.signal,
-        exe = ?metadata.exe_path,
+        exe = ?exe_log,
         "received core dump"
     );
 
@@ -375,4 +380,18 @@ pub(crate) fn parse_executable_build_id(path: &str) -> Option<String> {
                 })
                 .next()
         })
+}
+
+/// Truncate a string to max bytes, respecting UTF-8 char boundaries.
+/// Used before logging attacker-controlled strings to /dev/kmsg,
+/// which drops lines exceeding 1024 bytes entirely.
+fn truncate_for_log(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
