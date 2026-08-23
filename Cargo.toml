@@ -5,7 +5,8 @@ edition = "2024"
 rust-version = "1.85"
 
 [dependencies]
-# ELF parsing — used for the executable (trusted input), NOT the core dump
+# ELF parsing — the executable may be attacker-controlled; elf crate 0.8
+# is pure safe Rust and handles untrusted input.
 elf = "0.8"
 
 # zstd streaming compression — same format as systemd-coredump
