@@ -133,7 +133,14 @@ pub fn process_core_dump(
     // header table. The executable may be attacker-controlled (users
     // can crash their own binaries), but elf crate 0.8 is pure safe
     // Rust and handles untrusted input safely.
-    let build_id = parse_executable_build_id(&metadata.exe_path);
+    //
+    // Open /proc/<pid>/exe directly (magic link) for build ID extraction.
+    // This avoids TOCTOU between read_link and open, and works even if
+    // the executable was unlinked (e.g., after a package upgrade).
+    // Falls back to the resolved path string if the magic link is gone.
+    let proc_exe = format!("/proc/{}/exe", metadata.pid);
+    let build_id = parse_executable_build_id(&proc_exe)
+        .or_else(|| parse_executable_build_id(&metadata.exe_path));
 
     // Best-effort: the crashed process's /proc entry disappears
     // after the handler exits. WARNING: if the PID has been
