@@ -422,15 +422,28 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vdr"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
- "elf",
  "tracing",
  "tracing-subscriber",
+ "vdr-core",
+]
+
+[[package]]
+name = "vdr-core"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "elf",
+ "tracing",
  "zstd",
 ]
+
+[[package]]
+name = "vdrd"
+version = "0.1.3"
 
 [[package]]
 name = "windows-link"

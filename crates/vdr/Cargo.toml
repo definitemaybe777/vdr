@@ -1,0 +1,12 @@
+[package]
+name = "vdr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vdr-core = { path = "../vdr-core" }
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

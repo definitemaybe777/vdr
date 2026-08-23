@@ -1,0 +1,11 @@
+[package]
+name = "vdr-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+elf = "0.8"
+zstd = "0.13"
+anyhow = "1.0"
+tracing = "0.1"

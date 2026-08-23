@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 
 use clap::Parser;
-use vdr::{CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path};
+use vdr_core::{CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path};
 
 /// vdr — Voyage Data Recorder
 ///

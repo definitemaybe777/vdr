@@ -1,23 +1,8 @@
-[package]
-name = "vdr"
+[workspace]
+members = ["crates/vdr-core", "crates/vdr", "crates/vdrd"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
-
-[dependencies]
-# ELF parsing — the executable may be attacker-controlled; elf crate 0.8
-# is pure safe Rust and handles untrusted input.
-elf = "0.8"
-
-# zstd streaming compression — same format as systemd-coredump
-zstd = "0.13"
-
-# CLI arg parsing — kernel passes %P %u %g %s %t %h %E %c %d
-clap = { version = "4.6", features = ["derive"] }
-
-# Error handling with context
-anyhow = "1.0"
-
-# Structured logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
