@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+use std::sync::Mutex;
+
 use clap::Parser;
 use vdr::{CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path};
 
@@ -47,10 +49,36 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Initialize structured logging to stderr.
-    // Default to "info" if RUST_LOG is unset — crash events should be
-    // visible without extra configuration.
+    // Occupy fd 1 and fd 2 with /dev/null before doing anything else.
+    //
+    // In pipe mode, the kernel only sets up fd 0 (stdin = core dump pipe).
+    // fd 1 and fd 2 are not open. The first file we open would get fd 1,
+    // and tracing's default stdout writer would write into our core dump
+    // file — corrupting it.
+    //
+    // These handles are intentionally leaked: they hold fd 1 and 2
+    // for the process lifetime so no data file can claim them.
+    let _null1 = std::fs::OpenOptions::new().write(true).open("/dev/null");
+    let _null2 = std::fs::OpenOptions::new().write(true).open("/dev/null");
+
+    // Log to /dev/kmsg (kernel ring buffer, readable via `dmesg`).
+    // /dev/kmsg works even when the disk is full (stored in memory),
+    // which is exactly when a crash handler needs logging most.
+    let kmsg = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/kmsg")
+        .unwrap_or_else(|_| {
+            // /dev/kmsg unavailable — fall back to /dev/null.
+            // Logging is lost, but fd 1/2 are already safe.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .expect("failed to open /dev/null")
+        });
+
     tracing_subscriber::fmt()
+        .with_writer(Mutex::new(kmsg))
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
