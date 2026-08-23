@@ -22,10 +22,23 @@ pub fn disable_core_dump() -> io::Result<()> {
     }
 }
 
-/// Set the process file-creation mask and return the previous value.
+/// RAII guard for the process file-creation mask.
 ///
-/// umask is process-global; callers must ensure single-threaded
-/// execution during the masked window.
-pub fn set_umask(mask: u32) -> u32 {
-    unsafe { libc::umask(mask) }
+/// umask is process-global; the guard restores the previous value
+/// on drop, including on early return via `?` or panic.
+pub struct UmaskGuard {
+    prev: u32,
+}
+
+impl UmaskGuard {
+    pub fn new(mask: u32) -> Self {
+        let prev = unsafe { libc::umask(mask) };
+        Self { prev }
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe { libc::umask(self.prev) };
+    }
 }

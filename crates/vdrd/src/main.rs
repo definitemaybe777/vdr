@@ -45,37 +45,35 @@ fn main() -> Result<()> {
 
 fn init_logging() {
     let kmsg = OpenOptions::new()
-    .write(true)
-    .open("/dev/kmsg")
-    .unwrap_or_else(|_| {
-        OpenOptions::new()
         .write(true)
-        .open("/dev/null")
-        .expect("failed to open /dev/null for log fallback")
-    });
+        .open("/dev/kmsg")
+        .unwrap_or_else(|_| {
+            OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .expect("failed to open /dev/null for log fallback")
+        });
 
     tracing_subscriber::fmt()
-    .with_writer(Mutex::new(kmsg))
-    .with_ansi(false)
-    .with_target(false)
-    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-    .init();
+        .with_writer(Mutex::new(kmsg))
+        .with_ansi(false)
+        .with_target(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 }
 
 fn register_signals() -> Result<Arc<AtomicBool>> {
     let shutdown = Arc::new(AtomicBool::new(false));
-    flag::register(SIGTERM, shutdown.clone())
-    .context("failed to register SIGTERM handler")?;
-    flag::register(SIGINT, shutdown.clone())
-    .context("failed to register SIGINT handler")?;
+    flag::register(SIGTERM, shutdown.clone()).context("failed to register SIGTERM handler")?;
+    flag::register(SIGINT, shutdown.clone()).context("failed to register SIGINT handler")?;
     Ok(shutdown)
 }
 
 fn create_socket_dir() -> Result<()> {
     fs::create_dir_all(SOCKET_DIR)
-    .with_context(|| format!("failed to create socket directory {}", SOCKET_DIR))?;
+        .with_context(|| format!("failed to create socket directory {}", SOCKET_DIR))?;
     fs::set_permissions(SOCKET_DIR, Permissions::from_mode(0o700))
-    .with_context(|| format!("failed to set permissions on {}", SOCKET_DIR))?;
+        .with_context(|| format!("failed to set permissions on {}", SOCKET_DIR))?;
     Ok(())
 }
 
@@ -84,19 +82,18 @@ fn bind_socket() -> Result<UnixListener> {
 
     // umask 0177 makes bind() create the socket file at 0600,
     // eliminating the bind → set_permissions race window.
-    // Process-global; vdrd is single-threaded here.
-    let old_umask = ffi::set_umask(0o177);
+    // Process-global; restored via Drop on scope exit, including
+    // early return from `?`.
+    let _umask_guard = ffi::UmaskGuard::new(0o177);
 
     let listener = UnixListener::bind(SOCKET_PATH)
-    .with_context(|| format!("failed to bind socket {}", SOCKET_PATH))?;
-
-    ffi::set_umask(old_umask);
+        .with_context(|| format!("failed to bind socket {}", SOCKET_PATH))?;
 
     listener
-    .set_nonblocking(true)
-    .context("failed to set socket non-blocking")?;
+        .set_nonblocking(true)
+        .context("failed to set socket non-blocking")?;
     fs::set_permissions(SOCKET_PATH, Permissions::from_mode(0o600))
-    .with_context(|| format!("failed to set permissions on {}", SOCKET_PATH))?;
+        .with_context(|| format!("failed to set permissions on {}", SOCKET_PATH))?;
     Ok(listener)
 }
 
