@@ -1,14 +1,17 @@
 // vdrd: coredump socket daemon.
-// Skeleton: bind, accept, log. Core processing begins in Feature #7.
+//
+// Current state: bind, accept, log. Core dumps are discarded;
+// processing is not yet implemented.
 //
 // Socket mode: @/run/vdr/coredump.sock (simple mode, no request/ack).
-// The @@ request/ack protocol is deferred to Feature #7.
+// The @@ request/ack protocol is not implemented.
 
 #![deny(unsafe_code)]
 
 mod ffi;
 
 use std::fs::{self, OpenOptions, Permissions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,8 +30,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 fn main() -> Result<()> {
     init_logging();
 
-    // Prevent core-dump recursion: if vdrd crashes, do not send
-    // our own core back to the coredump socket.
     if let Err(e) = ffi::disable_core_dump() {
         warn!(error = %e, "failed to disable core dump for vdrd; recursion protection may be inactive");
     }
@@ -113,13 +114,8 @@ fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
 }
 
 fn bind_socket() -> Result<UnixListener> {
-    // Remove stale socket file from a previous run.
     let _ = fs::remove_file(SOCKET_PATH);
 
-    // umask 0177 makes bind() create the socket file at 0600,
-    // eliminating the bind → set_permissions race window.
-    // Process-global; restored via Drop on scope exit, including
-    // early return from `?`.
     let _umask_guard = ffi::UmaskGuard::new(0o177);
 
     let listener = UnixListener::bind(SOCKET_PATH)
@@ -136,9 +132,24 @@ fn bind_socket() -> Result<UnixListener> {
 fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((_stream, addr)) => {
-                info!(peer = ?addr, "connection received (skeleton: core discarded)");
-                // Stream is dropped at end of arm; no processing in skeleton.
+            Ok((stream, addr)) => {
+                match ffi::get_peer_pidfd(&stream) {
+                    Ok(pidfd) => {
+                        info!(
+                            peer = ?addr,
+                            pidfd = pidfd.as_raw_fd(),
+                              "connection received (pidfd obtained; core discarded)"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            peer = ?addr,
+                            error = %e,
+                            "failed to obtain peer pidfd; dropping connection"
+                        );
+                    }
+                }
+                // stream and pidfd (if any) dropped at end of arm.
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(POLL_INTERVAL);
