@@ -111,8 +111,11 @@ fn main() -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut stdin_lock = stdin.lock();
 
-    // Return 0 by convention. The kernel uses UMH_WAIT_EXEC for pipe
-    // helpers — it only checks that exec succeeded, not the exit code.
-    let _stored = process_core_dump(&mut stdin_lock, &metadata, &storage)?;
+    // The kernel uses UMH_WAIT_EXEC — it only checks that exec succeeded,
+    // not the exit code. Since fd 2 is /dev/null, anyhow's default error
+    // output is lost. We must log failures ourselves.
+    if let Err(e) = process_core_dump(&mut stdin_lock, &metadata, &storage) {
+        tracing::error!(error = ?e, "failed to store core dump");
+    }
     Ok(())
 }
