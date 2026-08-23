@@ -185,15 +185,18 @@ pub fn process_core_dump(
     let mut encoder = zstd::stream::Encoder::new(file, storage.zstd_level)
         .with_context(|| "creating zstd encoder")?;
 
-    let mut limited_reader = reader.take(storage.max_core_size);
+    // Read up to max_core_size + 1 bytes. If we read more than max_core_size,
+    // the core dump was truncated. Using take(max + 1) instead of take(max)
+    // avoids false positive when the core is exactly max_core_size bytes.
+    let mut limited_reader = reader.take(storage.max_core_size + 1);
     let bytes_in = std::io::copy(&mut limited_reader, &mut encoder)
         .with_context(|| "streaming core dump through zstd encoder")?;
 
-    if bytes_in >= storage.max_core_size {
+    if bytes_in > storage.max_core_size {
         warn!(
             bytes_in,
             max = storage.max_core_size,
-            "core dump may be truncated (hit size limit)"
+            "core dump truncated (exceeded size limit)"
         );
     }
 

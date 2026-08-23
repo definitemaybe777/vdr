@@ -59,36 +59,32 @@ fn main() -> anyhow::Result<()> {
     //
     // These handles are intentionally leaked: they hold fd 1 and 2
     // for the process lifetime so no data file can claim them.
-    let _null1 = std::fs::OpenOptions::new()
-    .write(true)
-    .open("/dev/null");
-    let _null2 = std::fs::OpenOptions::new()
-    .write(true)
-    .open("/dev/null");
+    let _null1 = std::fs::OpenOptions::new().write(true).open("/dev/null");
+    let _null2 = std::fs::OpenOptions::new().write(true).open("/dev/null");
 
     // Log to /dev/kmsg (kernel ring buffer, readable via `dmesg`).
     // /dev/kmsg works even when the disk is full (stored in memory),
     // which is exactly when a crash handler needs logging most.
     let kmsg = std::fs::OpenOptions::new()
-    .write(true)
-    .open("/dev/kmsg")
-    .unwrap_or_else(|_| {
-        // /dev/kmsg unavailable — fall back to /dev/null.
-        // Logging is lost, but fd 1/2 are already safe.
-        std::fs::OpenOptions::new()
         .write(true)
-        .open("/dev/null")
-        .expect("failed to open /dev/null")
-    });
+        .open("/dev/kmsg")
+        .unwrap_or_else(|_| {
+            // /dev/kmsg unavailable — fall back to /dev/null.
+            // Logging is lost, but fd 1/2 are already safe.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .expect("failed to open /dev/null")
+        });
 
     tracing_subscriber::fmt()
-    .with_writer(Mutex::new(kmsg))
-    .with_ansi(false)
-    .with_env_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-    )
-    .init();
+        .with_writer(Mutex::new(kmsg))
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
 
