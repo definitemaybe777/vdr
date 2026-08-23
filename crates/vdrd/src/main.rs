@@ -36,10 +36,10 @@ fn main() -> Result<()> {
     let shutdown = register_signals()?;
 
     create_socket_dir()?;
-    verify_dir_perms(SOCKET_DIR)?;
+    verify_perms(SOCKET_DIR, 0o700, "directory")?;
 
     let listener = bind_socket()?;
-    verify_socket_perms(SOCKET_PATH)?;
+    verify_perms(SOCKET_PATH, 0o600, "socket")?;
 
     info!(path = SOCKET_PATH, "vdrd listening");
 
@@ -83,18 +83,30 @@ fn create_socket_dir() -> Result<()> {
     Ok(())
 }
 
-fn verify_dir_perms(path: &str) -> Result<()> {
-    let meta = fs::metadata(path).with_context(|| format!("failed to stat directory {}", path))?;
+/// Verify that a path is owned by root:root with the expected mode.
+///
+/// This re-stats after `create_socket_dir` / `bind_socket` to confirm
+/// the filesystem actually honored `set_permissions`. It catches:
+/// - filesystems that silently ignore mode changes (some FUSE mounts)
+/// - future regressions if umask or set_permissions is removed
+/// - externally-provided sockets when socket activation is added
+///
+/// Not a substitute for R13 L2-L4: a path-based stat follows symlinks,
+/// so this is sound only when the parent directory is 0700 root:root.
+fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
+    let meta = fs::metadata(path).with_context(|| format!("failed to stat {} {}", kind, path))?;
     let mode = meta.mode() & 0o777;
     let uid = meta.uid();
     let gid = meta.gid();
-    if mode != 0o700 || uid != 0 || gid != 0 {
+    if mode != expected || uid != 0 || gid != 0 {
         bail!(
-            "directory {} has mode {:o}, owner {}:{}, expected 0700 root:root",
+            "{} {} has mode {:o}, owner {}:{}, expected {:o} root:root",
+            kind,
             path,
             mode,
             uid,
-            gid
+            gid,
+            expected
         );
     }
     Ok(())
@@ -119,23 +131,6 @@ fn bind_socket() -> Result<UnixListener> {
     fs::set_permissions(SOCKET_PATH, Permissions::from_mode(0o600))
         .with_context(|| format!("failed to set permissions on {}", SOCKET_PATH))?;
     Ok(listener)
-}
-
-fn verify_socket_perms(path: &str) -> Result<()> {
-    let meta = fs::metadata(path).with_context(|| format!("failed to stat socket {}", path))?;
-    let mode = meta.mode() & 0o777;
-    let uid = meta.uid();
-    let gid = meta.gid();
-    if mode != 0o600 || uid != 0 || gid != 0 {
-        bail!(
-            "socket {} has mode {:o}, owner {}:{}, expected 0600 root:root",
-            path,
-            mode,
-            uid,
-            gid
-        );
-    }
-    Ok(())
 }
 
 fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
