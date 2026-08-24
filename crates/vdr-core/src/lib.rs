@@ -37,7 +37,13 @@ pub struct CrashMetadata {
     /// %s — Signal number that caused the crash
     pub signal: u32,
 
-    /// %t — Unix timestamp of the crash
+    /// %t — Unix timestamp of the crash.
+    ///
+    /// In pipe mode, provided by the kernel (%t).
+    /// In socket mode, there is no kernel-provided timestamp;
+    /// vdrd uses SystemTime::now() at processing time. The gap
+    /// is typically <100ms (accept poll interval) but may be
+    /// larger under load.
     pub timestamp: u64,
 
     /// %h — Hostname
@@ -51,6 +57,14 @@ pub struct CrashMetadata {
 
     /// %d — Dumpable flag. See CVE-2022-4415.
     pub dumpable: u32,
+
+    /// Whether credentials (uid/gid) are from a trusted kernel source.
+    ///
+    /// In pipe mode, always true — %u/%g come from kernel argv.
+    /// In socket mode, true only if the crashing task was still alive
+    /// when pidfd_info was queried; false if the task was reaped
+    /// (uid/gid default to 0 and are not trustworthy).
+    pub creds_available: bool,
 }
 
 /// Storage configuration for core dumps.
@@ -251,6 +265,7 @@ pub fn process_core_dump(
           comm = ?comm,
           core_limit = metadata.core_limit,
           dumpable = metadata.dumpable,
+          creds_available = metadata.creds_available,
           hostname = %metadata.hostname,
           "core dump stored"
     );

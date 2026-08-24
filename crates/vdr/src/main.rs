@@ -103,6 +103,7 @@ fn main() -> anyhow::Result<()> {
         exe_path,
         core_limit: args.core_limit,
         dumpable: args.dumpable,
+        creds_available: true,
     };
 
     let storage = StorageConfig::default();
