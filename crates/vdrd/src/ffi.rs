@@ -48,13 +48,20 @@ impl Drop for UmaskGuard {
 /// Obtain a kernel-pinned pidfd for the peer of an accepted connection.
 ///
 /// Uses SO_PEERPIDFD (Linux 6.5+, coredump socket 6.16+) to get a
-/// stable fd reference to the crashing task. The pidfd remains valid
-/// even if the task is SIGKILLed during coredump generation — there
-/// is no race window between reading the pid and using it.
+/// stable fd reference to the crashing task. The pidfd is pinned by
+/// the kernel at connect time, not derived from /proc or command-line
+/// arguments, so it cannot be spoofed or replaced after the fact.
 ///
-/// The pidfd is pinned by the kernel at accept time, not derived from
-/// /proc or command-line arguments, so it cannot be spoofed by the
-/// crashing task or replaced after the fact.
+/// On Linux 6.16+, the pidfs entry is stashed at connect time, so the
+/// pidfd remains valid even if the crashing task has exited and been
+/// reaped before this call. On 6.5-6.15, EINVAL is returned for reaped
+/// peers entirely; no pidfd is obtained.
+///
+/// Note: while the pidfd itself is stable, credentials (PIDFD_INFO_CREDS:
+/// euid/egid/suid/sgid/fsuid/fsgid) are only available while the
+/// task_struct exists. A reaped task's credentials are gone — the pidfd
+/// is valid but credential queries return no data. Callers that need
+/// credentials must handle the missing case.
 pub fn get_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
     let mut pidfd: libc::c_int = -1;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
