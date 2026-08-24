@@ -30,6 +30,8 @@ fn main() -> Result<()> {
     check_kernel_version()?;
     init_logging();
 
+    // Prevent core-dump recursion: if vdrd crashes, do not send
+    // our own core back to the coredump socket.
     if let Err(e) = ffi::disable_core_dump() {
         warn!(error = %e, "failed to disable core dump for vdrd; recursion protection may be inactive");
     }
@@ -141,6 +143,10 @@ fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
 fn bind_socket() -> Result<UnixListener> {
     let _ = fs::remove_file(SOCKET_PATH);
 
+    // umask 0177 makes bind() create the socket file at 0600,
+    // eliminating the bind → set_permissions race window.
+    // Process-global; restored via Drop on scope exit, including
+    // early return from `?`.
     let _umask_guard = ffi::UmaskGuard::new(0o177);
 
     let listener = UnixListener::bind(SOCKET_PATH)

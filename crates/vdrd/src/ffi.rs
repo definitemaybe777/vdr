@@ -9,6 +9,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 // Request flags for pidfd_info.mask (input to PIDFD_GET_INFO).
+//
+// PIDFD_INFO_EXIT comes from libc to avoid transcription errors.
+// PIDFD_INFO_COREDUMP is not yet in libc (added in kernel 6.16).
 const PIDFD_INFO_EXIT: u64 = libc::PIDFD_INFO_EXIT as u64;
 const PIDFD_INFO_COREDUMP: u64 = 1 << 4;
 
@@ -191,6 +194,8 @@ pub fn get_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
         ));
     }
 
+    // OwnedFd::from_raw_fd panics on -1; guard against the kernel
+    // returning an invalid fd despite reporting success.
     if pidfd < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -198,6 +203,8 @@ pub fn get_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
         ));
     }
 
+    // The kernel allocates a new fd and transfers ownership to us.
+    // OwnedFd closes it on drop.
     Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
 }
 
