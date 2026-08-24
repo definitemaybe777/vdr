@@ -222,8 +222,8 @@ fn handle_connection(mut stream: UnixStream, addr: SocketAddr) {
     }
 
     // Build metadata from kernel-pinned pidfd info.
-    // When the task is reaped, ruid/rgid are unfilled (0 from Default)
-    // and the warning above explains the discrepancy.
+    // When the task is reaped, ruid/rgid are unfilled (0 from kernel
+    // zero-init) and the warning above explains the discrepancy.
     let metadata = CrashMetadata {
         pid: info.pid,
         uid: info.ruid,

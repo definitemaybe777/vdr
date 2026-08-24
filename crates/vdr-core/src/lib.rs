@@ -139,6 +139,7 @@ pub fn process_core_dump(
         gid = metadata.gid,
         signal = metadata.signal,
         exe = ?exe_log,
+        creds_available = metadata.creds_available,
         "received core dump"
     );
 
