@@ -11,7 +11,6 @@
 mod ffi;
 
 use std::fs::{self, OpenOptions, Permissions};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -209,7 +208,7 @@ fn handle_connection(stream: UnixStream, addr: SocketAddr) {
 
     info!(
         peer = ?addr,
-        pidfd = pidfd.as_raw_fd(),
+        pid = info.pid,
           "connection received (crashing task verified; core discarded)"
     );
 
