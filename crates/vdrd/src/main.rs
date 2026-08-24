@@ -13,7 +13,7 @@ mod ffi;
 use std::fs::{self, OpenOptions, Permissions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -117,8 +117,9 @@ fn create_socket_dir() -> Result<()> {
 /// - future regressions if umask or set_permissions is removed
 /// - externally-provided sockets when socket activation is added
 ///
-/// Not a substitute for R13 L2-L4: a path-based stat follows symlinks,
-/// so this is sound only when the parent directory is 0700 root:root.
+/// Not a substitute for credential-based verification: a path-based
+/// stat follows symlinks, so this is sound only when the parent
+/// directory is 0700 root:root.
 fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
     let meta = fs::metadata(path).with_context(|| format!("failed to stat {} {}", kind, path))?;
     let mode = meta.mode() & 0o777;
@@ -158,23 +159,7 @@ fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, addr)) => {
-                match ffi::get_peer_pidfd(&stream) {
-                    Ok(pidfd) => {
-                        info!(
-                            peer = ?addr,
-                            pidfd = pidfd.as_raw_fd(),
-                              "connection received (pidfd obtained; core discarded)"
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            peer = ?addr,
-                            error = %e,
-                            "failed to obtain peer pidfd; dropping connection"
-                        );
-                    }
-                }
-                // stream and pidfd (if any) dropped at end of arm.
+                handle_connection(stream, addr);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(POLL_INTERVAL);
@@ -185,6 +170,51 @@ fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
             }
         }
     }
+}
+
+fn handle_connection(stream: UnixStream, addr: SocketAddr) {
+    let pidfd = match ffi::get_peer_pidfd(&stream) {
+        Ok(pidfd) => pidfd,
+        Err(e) => {
+            error!(
+                peer = ?addr,
+                error = %e,
+                "failed to obtain peer pidfd; dropping connection"
+            );
+            return;
+        }
+    };
+
+    let info = match ffi::pidfd_get_info(&pidfd) {
+        Ok(info) => info,
+        Err(e) => {
+            error!(
+                peer = ?addr,
+                error = %e,
+                "failed to query pidfd info; dropping connection"
+            );
+            return;
+        }
+    };
+
+    if !info.is_coredump() {
+        error!(
+            peer = ?addr,
+            info_mask = info.mask,
+            coredump_mask = info.coredump_mask,
+            "not a crashing task; dropping connection"
+        );
+        return;
+    }
+
+    info!(
+        peer = ?addr,
+        pidfd = pidfd.as_raw_fd(),
+          "connection received (crashing task verified; core discarded)"
+    );
+
+    // stream, pidfd, and info are dropped at end of scope.
+    // Core dump data in the stream is not read and is discarded.
 }
 
 fn cleanup() {
