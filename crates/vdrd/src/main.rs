@@ -206,11 +206,23 @@ fn handle_connection(stream: UnixStream, addr: SocketAddr) {
         return;
     }
 
-    info!(
-        peer = ?addr,
-        pid = info.pid,
-          "connection received (crashing task verified; core discarded)"
-    );
+    if info.has_creds() {
+        info!(
+            peer = ?addr,
+            pid = info.pid,
+            ruid = info.ruid,
+            euid = info.euid,
+            coredump_root = info.is_coredump_root(),
+              "connection received (crashing task verified; core discarded)"
+        );
+    } else {
+        warn!(
+            peer = ?addr,
+            pid = info.pid,
+            coredump_root = info.is_coredump_root(),
+              "crashing task already reaped; credentials unavailable; core discarded"
+        );
+    }
 
     // stream, pidfd, and info are dropped at end of scope.
     // Core dump data in the stream is not read and is discarded.

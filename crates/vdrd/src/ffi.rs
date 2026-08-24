@@ -9,15 +9,20 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 // Request flags for pidfd_info.mask (input to PIDFD_GET_INFO).
-//
-// PIDFD_INFO_EXIT comes from libc to avoid transcription errors.
-// PIDFD_INFO_COREDUMP is not yet in libc (added in kernel 6.16).
 const PIDFD_INFO_EXIT: u64 = libc::PIDFD_INFO_EXIT as u64;
 const PIDFD_INFO_COREDUMP: u64 = 1 << 4;
+
+// Response flags in pidfd_info.mask (output).
+// PIDFD_INFO_CREDS is "Always returned, even if not requested" when
+// the task is alive — no need to set it in the request mask. Its
+// presence indicates the task was still alive and credentials are
+// populated. Absence means the task was reaped and credentials are gone.
+const PIDFD_INFO_CREDS: u64 = libc::PIDFD_INFO_CREDS as u64;
 
 // Flags in pidfd_info.coredump_mask (output).
 // Not yet in libc (added in kernel 6.16).
 const PIDFD_COREDUMPED: u32 = 1 << 0;
+const PIDFD_COREDUMP_ROOT: u32 = 1 << 3;
 
 /// Subset of the kernel's `struct pidfd_info` (include/uapi/linux/pidfd.h).
 ///
@@ -63,6 +68,27 @@ impl PidfdInfo {
     /// and should be rejected.
     pub fn is_coredump(&self) -> bool {
         (self.mask & PIDFD_INFO_COREDUMP) != 0 && (self.coredump_mask & PIDFD_COREDUMPED) != 0
+    }
+
+    /// Returns true if credentials are available in this response.
+    ///
+    /// Credentials are unconditionally populated by the kernel when
+    /// the task is still alive. For a reaped task, the kernel takes a
+    /// shortcut path that skips credential population, so this bit is
+    /// absent — credentials are gone with the task_struct.
+    pub fn has_creds(&self) -> bool {
+        (self.mask & PIDFD_INFO_CREDS) != 0
+    }
+
+    /// Returns true if the kernel determined this coredump should be
+    /// treated as sensitive (root-level access only).
+    ///
+    /// This flag is set by the kernel based on SUID/SGID bits,
+    /// capabilities, and dumpable status — a single authoritative
+    /// sensitivity judgment rather than client-side computation.
+    /// It is stored in pidfs attributes and survives task reaping.
+    pub fn is_coredump_root(&self) -> bool {
+        (self.coredump_mask & PIDFD_COREDUMP_ROOT) != 0
     }
 }
 
@@ -136,11 +162,10 @@ impl Drop for UmaskGuard {
 /// reaped before this call. On 6.5-6.15, EINVAL is returned for reaped
 /// peers entirely; no pidfd is obtained.
 ///
-/// Note: while the pidfd itself is stable, credentials (PIDFD_INFO_CREDS:
-/// euid/egid/suid/sgid/fsuid/fsgid) are only available while the
-/// task_struct exists. A reaped task's credentials are gone — the pidfd
-/// is valid but credential queries return no data. Callers that need
-/// credentials must handle the missing case.
+/// Note: while the pidfd itself is stable, credentials are only
+/// available while the task_struct exists. A reaped task's credentials
+/// are gone — the pidfd is valid but credential queries return no data.
+/// Callers that need credentials must handle the missing case.
 pub fn get_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
     let mut pidfd: libc::c_int = -1;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -180,10 +205,13 @@ pub fn get_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
 ///
 /// Requests exit and coredump info. Exit info is requested to avoid
 /// ESRCH when the crashing task has already been reaped; coredump
-/// info is the actual target.
+/// info is the actual target. Credentials are always returned when
+/// the task is alive and do not need to be requested.
 ///
 /// The caller should check `is_coredump()` on the result to verify
-/// the connection is from a crashing task.
+/// the connection is from a crashing task, `has_creds()` to determine
+/// whether credentials are available, and `is_coredump_root()` for
+/// the kernel's sensitivity judgment.
 pub fn pidfd_get_info(pidfd: &OwnedFd) -> io::Result<PidfdInfo> {
     let mut info = PidfdInfo {
         mask: PIDFD_INFO_EXIT | PIDFD_INFO_COREDUMP,
