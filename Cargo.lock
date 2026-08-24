@@ -480,6 +480,7 @@ dependencies = [
  "signal-hook",
  "tracing",
  "tracing-subscriber",
+ "vdr-core",
 ]
 
 [[package]]

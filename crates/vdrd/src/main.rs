@@ -15,12 +15,13 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use tracing::{error, info, warn};
+use vdr_core::{CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path};
 
 const SOCKET_DIR: &str = "/run/vdr";
 const SOCKET_PATH: &str = "/run/vdr/coredump.sock";
@@ -30,8 +31,6 @@ fn main() -> Result<()> {
     check_kernel_version()?;
     init_logging();
 
-    // Prevent core-dump recursion: if vdrd crashes, do not send
-    // our own core back to the coredump socket.
     if let Err(e) = ffi::disable_core_dump() {
         warn!(error = %e, "failed to disable core dump for vdrd; recursion protection may be inactive");
     }
@@ -143,10 +142,6 @@ fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
 fn bind_socket() -> Result<UnixListener> {
     let _ = fs::remove_file(SOCKET_PATH);
 
-    // umask 0177 makes bind() create the socket file at 0600,
-    // eliminating the bind → set_permissions race window.
-    // Process-global; restored via Drop on scope exit, including
-    // early return from `?`.
     let _umask_guard = ffi::UmaskGuard::new(0o177);
 
     let listener = UnixListener::bind(SOCKET_PATH)
@@ -177,7 +172,7 @@ fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
     }
 }
 
-fn handle_connection(stream: UnixStream, addr: SocketAddr) {
+fn handle_connection(mut stream: UnixStream, addr: SocketAddr) {
     let pidfd = match ffi::get_peer_pidfd(&stream) {
         Ok(pidfd) => pidfd,
         Err(e) => {
@@ -212,26 +207,47 @@ fn handle_connection(stream: UnixStream, addr: SocketAddr) {
         return;
     }
 
-    if info.has_creds() {
-        info!(
-            peer = ?addr,
-            pid = info.pid,
-            ruid = info.ruid,
-            euid = info.euid,
-            coredump_root = info.is_coredump_root(),
-              "connection received (crashing task verified; core discarded)"
-        );
-    } else {
+    if !info.has_creds() {
         warn!(
             peer = ?addr,
             pid = info.pid,
-            coredump_root = info.is_coredump_root(),
-              "crashing task already reaped; credentials unavailable; core discarded"
+            "crashing task already reaped; credentials unavailable, using defaults"
         );
     }
 
-    // stream, pidfd, and info are dropped at end of scope.
-    // Core dump data in the stream is not read and is discarded.
+    // Build metadata from kernel-pinned pidfd info.
+    // When the task is reaped, ruid/rgid are unfilled (0 from Default)
+    // and the warning above explains the discrepancy.
+    let metadata = CrashMetadata {
+        pid: info.pid,
+        uid: info.ruid,
+        gid: info.rgid,
+        signal: info.coredump_signal,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        hostname: read_hostname(),
+        exe_path: resolve_exe_path(info.pid, ""),
+        core_limit: 0,
+        dumpable: info.dumpable(),
+    };
+
+    let storage = StorageConfig::default();
+
+    if let Err(e) = process_core_dump(&mut stream, &metadata, &storage) {
+        error!(error = ?e, "failed to store core dump");
+    }
+}
+
+/// Read the system hostname from /proc.
+///
+/// /proc/sys/kernel/hostname is the kernel-maintained source that
+/// core_pattern %h also reads. Returns an empty string on failure.
+fn read_hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn cleanup() {

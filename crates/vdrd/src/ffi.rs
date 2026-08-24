@@ -9,9 +9,6 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 // Request flags for pidfd_info.mask (input to PIDFD_GET_INFO).
-//
-// PIDFD_INFO_EXIT comes from libc to avoid transcription errors.
-// PIDFD_INFO_COREDUMP is not yet in libc (added in kernel 6.16).
 const PIDFD_INFO_EXIT: u64 = libc::PIDFD_INFO_EXIT as u64;
 const PIDFD_INFO_COREDUMP: u64 = 1 << 4;
 
@@ -25,6 +22,7 @@ const PIDFD_INFO_CREDS: u64 = libc::PIDFD_INFO_CREDS as u64;
 // Flags in pidfd_info.coredump_mask (output).
 // Not yet in libc (added in kernel 6.16).
 const PIDFD_COREDUMPED: u32 = 1 << 0;
+const PIDFD_COREDUMP_USER: u32 = 1 << 2;
 const PIDFD_COREDUMP_ROOT: u32 = 1 << 3;
 
 /// Subset of the kernel's `struct pidfd_info` (include/uapi/linux/pidfd.h).
@@ -83,15 +81,20 @@ impl PidfdInfo {
         (self.mask & PIDFD_INFO_CREDS) != 0
     }
 
-    /// Returns true if the kernel determined this coredump should be
-    /// treated as sensitive (root-level access only).
+    /// Map kernel coredump flags to the dumpable value used by pipe
+    /// mode for log compatibility.
     ///
-    /// This flag is set by the kernel based on SUID/SGID bits,
-    /// capabilities, and dumpable status — a single authoritative
-    /// sensitivity judgment rather than client-side computation.
-    /// It is stored in pidfs attributes and survives task reaping.
-    pub fn is_coredump_root(&self) -> bool {
-        (self.coredump_mask & PIDFD_COREDUMP_ROOT) != 0
+    /// ROOT takes priority over USER: a root-level dump is always
+    /// sensitive regardless of whether USER is also set. When neither
+    /// flag is set, returns 0.
+    pub fn dumpable(&self) -> u32 {
+        if (self.coredump_mask & PIDFD_COREDUMP_ROOT) != 0 {
+            2
+        } else if (self.coredump_mask & PIDFD_COREDUMP_USER) != 0 {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -215,10 +218,10 @@ pub fn get_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
 /// info is the actual target. Credentials are always returned when
 /// the task is alive and do not need to be requested.
 ///
-/// The caller should check `is_coredump()` on the result to verify
-/// the connection is from a crashing task, `has_creds()` to determine
-/// whether credentials are available, and `is_coredump_root()` for
-/// the kernel's sensitivity judgment.
+/// The caller should check `is_coredump()` to verify the connection
+/// is from a crashing task, and `has_creds()` to determine whether
+/// credentials are available. `dumpable()` maps kernel sensitivity
+/// flags to the value used by pipe mode for log compatibility.
 pub fn pidfd_get_info(pidfd: &OwnedFd) -> io::Result<PidfdInfo> {
     let mut info = PidfdInfo {
         mask: PIDFD_INFO_EXIT | PIDFD_INFO_COREDUMP,
