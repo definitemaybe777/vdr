@@ -100,8 +100,8 @@ pub struct StoredDump {
 
 /// Process a core dump from any Read source.
 ///
-/// Shared core logic. Currently called by vdr (pipe handler, reads
-/// from stdin). vdrd (socket daemon) is planned for v0.2.
+/// Shared core logic called by both vdr (pipe handler, reads from
+/// stdin) and vdrd (socket daemon, reads from accepted connection).
 ///
 /// Steps:
 ///   1. Extract build ID from the executable file
