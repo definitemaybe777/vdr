@@ -28,6 +28,7 @@ const SOCKET_PATH: &str = "/run/vdr/coredump.sock";
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> Result<()> {
+    check_kernel_version()?;
     init_logging();
 
     if let Err(e) = ffi::disable_core_dump() {
@@ -47,6 +48,30 @@ fn main() -> Result<()> {
     run_accept_loop(&listener, &shutdown);
 
     cleanup();
+    Ok(())
+}
+
+fn check_kernel_version() -> Result<()> {
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .context("failed to read kernel version")?;
+
+    let mut parts = release.split('.');
+    let major: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .context("failed to parse kernel major version")?;
+    let minor: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .context("failed to parse kernel minor version")?;
+
+    if major < 6 || (major == 6 && minor < 16) {
+        bail!(
+            "kernel {} does not support coredump sockets; Linux 6.16+ required",
+            release.trim()
+        );
+    }
+
     Ok(())
 }
 
