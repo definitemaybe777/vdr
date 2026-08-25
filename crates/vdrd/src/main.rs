@@ -245,8 +245,13 @@ fn handle_connection(mut stream: UnixStream, addr: SocketAddr) {
 
 /// Read the system hostname from /proc.
 ///
-/// /proc/sys/kernel/hostname is the kernel-maintained source that
-/// core_pattern %h also reads. Returns an empty string on failure.
+/// Reads from vdrd's UTS namespace via /proc/sys/kernel/hostname.
+/// This may differ from pipe mode's %h, which reads from the
+/// crashing task's UTS namespace. For containerized workloads with
+/// separate UTS namespaces, the hostname may not match the
+/// crashing container's hostname.
+///
+/// Returns an empty string on failure.
 fn read_hostname() -> String {
     fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
