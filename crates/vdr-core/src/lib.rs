@@ -28,11 +28,17 @@ pub struct CrashMetadata {
     /// %P — PID of the crashed process
     pub pid: u32,
 
-    /// %u — Real UID of the crashed process
-    pub uid: u32,
+    /// %u — Real UID.
+    ///
+    /// In pipe mode, always Some — provided by kernel argv (%u).
+    /// In socket mode, None if the crashing task was reaped before
+    /// pidfd_info was queried (credentials gone with task_struct).
+    pub uid: Option<u32>,
 
-    /// %g — Real GID of the crashed process
-    pub gid: u32,
+    /// %g — Real GID.
+    ///
+    /// Same availability semantics as uid.
+    pub gid: Option<u32>,
 
     /// %s — Signal number that caused the crash
     pub signal: u32,
@@ -57,14 +63,6 @@ pub struct CrashMetadata {
 
     /// %d — Dumpable flag. See CVE-2022-4415.
     pub dumpable: u32,
-
-    /// Whether credentials (uid/gid) are from a trusted kernel source.
-    ///
-    /// In pipe mode, always true — %u/%g come from kernel argv.
-    /// In socket mode, true only if the crashing task was still alive
-    /// when pidfd_info was queried; false if the task was reaped
-    /// (uid/gid default to 0 and are not trustworthy).
-    pub creds_available: bool,
 }
 
 /// Storage configuration for core dumps.
@@ -135,11 +133,10 @@ pub fn process_core_dump(
 
     info!(
         pid = metadata.pid,
-        uid = metadata.uid,
-        gid = metadata.gid,
+        uid = ?metadata.uid,
+        gid = ?metadata.gid,
         signal = metadata.signal,
         exe = ?exe_log,
-        creds_available = metadata.creds_available,
         "received core dump"
     );
 
@@ -266,7 +263,6 @@ pub fn process_core_dump(
           comm = ?comm,
           core_limit = metadata.core_limit,
           dumpable = metadata.dumpable,
-          creds_available = metadata.creds_available,
           hostname = %metadata.hostname,
           "core dump stored"
     );

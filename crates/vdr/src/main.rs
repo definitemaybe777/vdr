@@ -95,15 +95,14 @@ fn main() -> anyhow::Result<()> {
 
     let metadata = CrashMetadata {
         pid: args.pid,
-        uid: args.uid,
-        gid: args.gid,
+        uid: Some(args.uid),
+        gid: Some(args.gid),
         signal: args.signal,
         timestamp: args.timestamp,
         hostname: args.hostname,
         exe_path,
         core_limit: args.core_limit,
         dumpable: args.dumpable,
-        creds_available: true,
     };
 
     let storage = StorageConfig::default();

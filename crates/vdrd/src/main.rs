@@ -217,17 +217,14 @@ fn handle_connection(mut stream: UnixStream, addr: SocketAddr) {
         warn!(
             peer = ?addr,
             pid = info.pid,
-            "crashing task already reaped; credentials unavailable, using defaults"
+            "crashing task already reaped; credentials unavailable"
         );
     }
 
-    // Build metadata from kernel-pinned pidfd info.
-    // When the task is reaped, ruid/rgid are unfilled (0 from kernel
-    // zero-init) and the warning above explains the discrepancy.
     let metadata = CrashMetadata {
         pid: info.pid,
-        uid: info.ruid,
-        gid: info.rgid,
+        uid: info.has_creds().then_some(info.ruid),
+        gid: info.has_creds().then_some(info.rgid),
         signal: info.coredump_signal,
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -237,7 +234,6 @@ fn handle_connection(mut stream: UnixStream, addr: SocketAddr) {
         exe_path: resolve_exe_path(info.pid, ""),
         core_limit: 0,
         dumpable: info.dumpable(),
-        creds_available: info.has_creds(),
     };
 
     let storage = StorageConfig::default();
