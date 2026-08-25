@@ -227,9 +227,9 @@ fn handle_connection(mut stream: UnixStream, addr: SocketAddr) {
         gid: info.has_creds().then_some(info.rgid),
         signal: info.coredump_signal,
         timestamp: SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0),
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
         hostname: read_hostname(),
         exe_path: resolve_exe_path(info.pid, ""),
         core_limit: 0,
