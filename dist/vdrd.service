@@ -40,6 +40,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
+PrivateNetwork=yes
 ProtectControlGroups=yes
 ProtectHostname=yes
 ProtectKernelModules=yes
@@ -55,9 +56,6 @@ Nice=9
 # Not used:
 #   PrivateDevices, ProtectKernelLogs — vdrd writes logs to /dev/kmsg
 #   ProtectKernelTunables — would block the sysctl write even with +
-#   PrivateNetwork — since systemd v254, implies PrivateMounts=yes,
-#                    which the + prefix on sysctl should handle, but
-#                    untested on this kernel/systemd combination
 
 [Install]
 WantedBy=multi-user.target
