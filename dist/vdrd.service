@@ -1,0 +1,60 @@
+[Unit]
+Description=vdrd coredump socket daemon
+Documentation=https://github.com/definitemaybe0/vdr
+After=local-fs.target
+ConditionKernelVersion=>=6.16
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vdrd
+
+# Wait for the socket to appear, then advertise it as core_pattern.
+# If vdrd fails to bind within TimeoutStartSec, the service is
+# marked as failed and core_pattern is not set.
+ExecStartPost=/bin/sh -c 'until test -S /run/vdr/coredump.sock; do sleep 0.1; done'
+ExecStartPost=/usr/sbin/sysctl -w kernel.core_pattern=@/run/vdr/coredump.sock
+
+# Reset to kernel default on stop so cores go to files, not a
+# dead socket.
+ExecStopPost=/usr/sbin/sysctl -w kernel.core_pattern=core
+
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=1
+TimeoutStartSec=10
+
+# Resource limits
+MemoryMax=256M
+TasksMax=4
+OOMScoreAdjust=500
+
+# Directories
+StateDirectory=vdr
+StateDirectoryMode=0700
+RuntimeDirectory=vdr
+RuntimeDirectoryMode=0700
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=disconnected
+PrivateNetwork=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+Nice=9
+
+# Not used:
+#   PrivateDevices, ProtectKernelLogs — vdrd writes logs to /dev/kmsg
+#   ProtectKernelTunables — ExecStartPost needs to write core_pattern
+
+[Install]
+WantedBy=multi-user.target

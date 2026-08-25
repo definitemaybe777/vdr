@@ -1,0 +1,21 @@
+# vdrd coredump socket daemon — kernel parameters
+#
+# Applied by systemd-sysctl.service at boot. These settings are
+# kernel-wide and must be active before vdrd starts.
+#
+# core_pattern itself is set by vdrd.service via ExecStartPost,
+# because the socket must exist before the kernel can use it.
+
+# Keep crashed processes alive until the coredump handler finishes
+# collecting metadata from /proc/<pid>/. The kernel default is 0
+# (don't wait), which means the crashing task may be reaped before
+# vdrd can read /proc/<pid>/exe and pidfd credentials. A non-zero
+# value allows the kernel to hold up to N crashing tasks
+# simultaneously while vdrd processes them sequentially.
+kernel.core_pipe_limit=16
+
+# Allow core dumps from SUID/SGID binaries. Mode 2 (suidsafe)
+# restricts dump file permissions to root-only. vdrd enforces
+# 0600 on all stored cores regardless, but without this setting
+# SUID/SGID crashes are silently skipped by the kernel.
+fs.suid_dumpable=2
