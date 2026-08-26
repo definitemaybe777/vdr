@@ -57,7 +57,7 @@ fn check_kernel_version() -> Result<()> {
     let release = fs::read_to_string("/proc/sys/kernel/osrelease")
         .context("failed to read kernel version")?;
 
-    let mut parts = release.split('.');
+    let mut parts = release.split(|c| c == '.' || c == '-');
     let major: u32 = parts
         .next()
         .and_then(|s| s.parse().ok())
