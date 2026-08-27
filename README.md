@@ -38,16 +38,24 @@ as potentially malicious input.
 
 - **No ACL attack surface** — Core files are 0600 root-only via
   `O_CREAT|O_EXCL`. No `setfacl`, no `libacl`. The `fs.suid_dumpable=2`
-  sysctl drop-in ships with vdrd to enable SUID/SGID core dumps; this is
-  safe because zero ACL code eliminates the CVE-2022-4415 class entirely.
+  sysctl drop-in ships with vdrd to enable SUID/SGID core dumps; this
+  is safe because 0600 root-only access control eliminates the
+  CVE-2022-4415 class entirely (the CVE's mechanism was an ACL entry
+  granting read access to the real UID — impossible without ACL code,
+  and the 0600 root-only default covers other leak paths too).
 
 **Hot path safety**
 
 - **No DWARF in the hot path** — vdr never parses DWARF in the recording
   path. A separate cold-path analysis tool (`vdr-analyze`) is planned but
-  not yet implemented. DWARF parsers (gimli, libdwarf) are explicitly not
-  security boundaries and have a sustained history of panics and CVEs
-  through 2025–2026.
+  not yet implemented. gimli's maintainer explicitly states it is not a
+  security boundary [gimli PR #889](https://github.com/gimli-rs/gimli/pull/889);
+  libdwarf's design goal includes handling corrupted input
+  ([libdwarf README](https://github.com/davea42/libdwarf-code/blob/main/README.md)),
+  but its own vulnerability database lists 239 entries as of July 2026
+  ([dwarfbug.html](https://www.prevanders.net/dwarfbug.html), latest:
+  DW202605-008). Neither should be relied upon as a security boundary
+  in the recording path.
 
 - **Streaming, bounded memory** — Core data streams through `io::copy`
   into a zstd encoder to disk, never fully loaded into RAM. Per-core
@@ -58,10 +66,12 @@ as potentially malicious input.
 **Credential integrity (pipe mode)**
 
 - **Race condition protection** — vdr trusts the kernel's `%d` dumpable
-  flag, not `/proc/pid/auxv`. An attacker can SIGKILL the crashing SUID
-  process, wait for PID recycling, then fork a new non-SUID process to
-  occupy the same PID — causing vdr to read the new process's auxv and
-  misclassify the core dump as non-sensitive.
+  flag, not `/proc/pid/auxv`. A handler that reads auxv is vulnerable
+  (CVE-2025-4598): an attacker can SIGKILL the crashing SUID process,
+  wait for PID recycling, then fork a new non-SUID process to occupy the
+  same PID — causing the handler to read the new process's auxv and
+  misclassify the core dump as non-sensitive. vdr avoids this by not
+  reading auxv.
 
 **Credential integrity (socket mode, Linux ≥ 6.16)**
 
