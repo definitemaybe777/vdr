@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+mod ffi;
+
 use std::sync::Mutex;
 
 use clap::Parser;
@@ -85,6 +87,14 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Defense-in-depth against core-dump recursion: the kernel's
+    // RLIMIT_CORE=1 sentinel is the primary guard, but
+    // PR_SET_DUMPABLE=0 stops the kernel from entering the coredump
+    // path at all.
+    if let Err(e) = ffi::disable_core_dump() {
+        tracing::warn!(error = %e, "failed to disable core dump; defense-in-depth inactive, kernel sentinel still applies");
+    }
 
     let args = Args::parse();
 
