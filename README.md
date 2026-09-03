@@ -90,20 +90,69 @@ as potentially malicious input.
 
 **Socket authentication (socket mode)**
 
-Four layers, all implemented:
+Two layers of authentication:
 
-- **L1** — Socket file permissions (0600 root:root), verified at startup
-- **L2** — `PIDFD_COREDUMPED` kernel flag (see note below)
-- **L3** — `SO_PEERPIDFD` (kernel-provided process reference, no race)
-- **L4** — `pidfd_info` credentials + `PIDFD_COREDUMP_ROOT`
+- **Layer 1 — Pre-connection access control.** The coredump socket
+  is `0600 root:root`; vdrd verifies this at startup and refuses to
+  start otherwise. At bind time, a `UmaskGuard(0o177)` eliminates the
+  bind→set_permissions race window, after which `verify_perms`
+  re-confirms mode + owner. An attacker who cannot connect never
+  reaches Layer 2.
 
-> **On L2**: `PIDFD_COREDUMPED` is set only by the kernel when a process
-> crashes. No userspace API currently exists to set it directly, so a
-> non-crashing process cannot fake this flag. However, this guarantee
-> holds only because no such API exists today — it is not a structural
-> impossibility. If a future kernel exposes a way to set the flag from
-> userspace, L2 would weaken. The other layers (L1, L3, L4) would still
-> apply, but L2 alone would no longer be sufficient.
+- **Layer 2 — Post-connection kernel authentication.** On accept,
+  vdrd obtains a kernel-pinned pidfd via `SO_PEERPIDFD`
+  (`getsockopt`), then issues `ioctl(PIDFD_GET_INFO)` on that pidfd.
+  The ioctl returns the peer's credentials
+  (euid/egid/suid/sgid/fsuid/fsgid), the `PIDFD_COREDUMPED` flag,
+  and the `PIDFD_COREDUMP_ROOT` sensitivity flag. The kernel sets
+  `PIDFD_COREDUMPED` before the connection is established
+  (`pidfs_coredump()` is called before `kernel_connect()`), so a
+  non-crashing process cannot fake a coredump request.
+
+  `SO_PEERPIDFD` is a `getsockopt`, not an ioctl, but it is a
+  prerequisite for `PIDFD_GET_INFO` — without a pidfd, the ioctl
+  cannot be issued. `PIDFD_COREDUMPED`, `PIDFD_COREDUMP_ROOT`, and
+  credentials are all returned in the same `ioctl(PIDFD_GET_INFO)`
+  struct; if the ioctl fails, all three fail together. The value of
+  two layers is that each fails for independent reasons: Layer 1
+  fails when the admin misconfigures socket permissions; Layer 2's
+  sensitivity determination fails only on a kernel bug in the
+  pidfd/coredump subsystem.
+
+  Credentials and sensitivity determination do not go through
+  `/proc/pid` path resolution — credentials are read directly from
+  `struct cred`, and sensitivity is read from
+  `pid->attr->coredump_mask` (stored on `struct pid`, not on
+  `task_struct`, so task reaping does not affect sensitivity). But
+  vdrd does read `/proc/pid/exe` via readlink to obtain the exe
+  path — this is affected by mount namespace differences in
+  container scenarios, but does not affect sensitivity
+  determination.
+
+  Credentials are populated only while the crashing task is alive.
+  When the task is reaped (`core_pipe_limit=0`, or incorrect ack
+  ordering in SOCK_REQ mode), credentials are empty, but
+  `PIDFD_COREDUMP_ROOT` remains available — sensitivity
+  determination is unaffected. Missing credentials is an
+  availability issue (UID/GID recorded as `None` in the journal),
+  not a security issue.
+
+  All core files are `0600 root-only` regardless of
+  `PIDFD_COREDUMP_ROOT`. `PIDFD_COREDUMP_ROOT` is mapped to the
+  `dumpable` field written to the journal; it does not drive
+  access control decisions.
+
+> **On `PIDFD_COREDUMPED`**: This flag is set only by the kernel
+> when a process crashes (`pidfs_coredump()` is called only within
+> the `do_coredump()` path); no userspace API currently exists to
+> set `coredump_mask` directly. But this is not a structural
+> guarantee — pidfs is gaining userspace-writable interfaces such
+> as xattrs, and if a future kernel exposes an API to set
+> `coredump_mask`, Layer 2 would weaken. `PIDFD_COREDUMP_ROOT`
+> lives in the same `coredump_mask` field and would likely weaken
+> with it. Layer 1 (socket permissions) would remain intact, but
+> the confused-deputy risk would need re-evaluation against the
+> weakened Layer 2.
 
 **Journal hygiene**
 
