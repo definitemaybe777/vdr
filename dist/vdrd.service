@@ -16,9 +16,6 @@ ExecStart=/usr/bin/vdrd
 ExecStartPost=/bin/sh -c 'until test -S /run/vdr/coredump.sock; do sleep 0.1; done'
 ExecStartPost=+/usr/bin/nsenter -t 1 -m /usr/sbin/sysctl -w kernel.core_pattern=@/run/vdr/coredump.sock
 
-# Reset to kernel default on stop.
-ExecStopPost=+/usr/bin/nsenter -t 1 -m /usr/sbin/sysctl -w kernel.core_pattern=core
-
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=1
