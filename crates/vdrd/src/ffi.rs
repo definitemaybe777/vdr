@@ -4,9 +4,10 @@
 
 #![allow(unsafe_code)]
 
+use std::env;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 // Request flags for pidfd_info.mask (input to PIDFD_GET_INFO).
 //
@@ -108,10 +109,10 @@ impl PidfdInfo {
 // our 72-byte PidfdInfo so the kernel fills through coredump_signal.
 //
 // Formula: (dir << 30) | (size << 16) | (type << 8) | nr
-//   dir  = 3 (_IOC_READ | _IOC_WRITE)
-//   type = 0xFF (PIDFS_IOCTL_MAGIC)
-//   nr   = 11
-//   size = sizeof(PidfdInfo) = 72
+// dir = 3 (_IOC_READ | _IOC_WRITE)
+// type = 0xFF (PIDFS_IOCTL_MAGIC)
+// nr = 11
+// size = sizeof(PidfdInfo) = 72
 //
 // Expected value: 0xC048FF0B
 const PIDFD_GET_INFO: libc::c_ulong = {
@@ -138,24 +139,114 @@ pub fn disable_core_dump() -> io::Result<()> {
     }
 }
 
-/// RAII guard for the process file-creation mask.
+// First fd number the socket-activation protocol passes
+// (sd_listen_fds(3): SD_LISTEN_FDS_START).
+const SD_LISTEN_FDS_START: libc::c_int = 3;
+
+/// Take the listening socket the service manager passed via socket
+/// activation.
 ///
-/// umask is process-global; the guard restores the previous value
-/// on drop, including on early return via `?` or panic.
-pub struct UmaskGuard {
-    prev: u32,
-}
-
-impl UmaskGuard {
-    pub fn new(mask: u32) -> Self {
-        let prev = unsafe { libc::umask(mask) };
-        Self { prev }
+/// Implements the sd_listen_fds(3) protocol by hand, so the daemon
+/// carries no sd-daemon dependency. The LISTEN_* variables are plain
+/// environment and are inherited by any child of the service manager,
+/// so they are a trust boundary: every claim is validated against
+/// this process before fd 3 is treated as ours.
+///
+/// Returns Ok(None) when no socket was handed to this process. The
+/// caller must refuse to run in that case; binding the path directly
+/// would race the service manager, which owns the socket file.
+pub fn systemd_listen_fd() -> io::Result<Option<UnixListener>> {
+    // $LISTEN_PID must name this process. Absent, unparsable, or stale
+    // values (set for an earlier process and inherited through an
+    // intermediary) mean fd 3 was not prepared for us.
+    let declared_pid: u32 = match env::var("LISTEN_PID").ok().and_then(|v| v.parse().ok()) {
+        Some(pid) => pid,
+        None => return Ok(None),
+    };
+    if declared_pid != std::process::id() {
+        return Ok(None);
     }
+
+    // This deployment passes exactly one listener.
+    if env::var("LISTEN_FDS")
+        .ok()
+        .and_then(|v| v.parse::<libc::c_int>().ok())
+        != Some(1)
+    {
+        return Ok(None);
+    }
+
+    // SAFETY: the checks above established that fd 3 was allocated for
+    // this process. Taking it into OwnedFd makes Rust close it on drop,
+    // including the early-return paths below.
+    let fd = unsafe { OwnedFd::from_raw_fd(SD_LISTEN_FDS_START) };
+
+    // Reject anything but a stream socket. A datagram listener would
+    // pass activation and then fail confusingly on accept(2); the
+    // service manager passes the same socket again on every restart,
+    // so a unit edited to the wrong Listen* type would otherwise only
+    // surface as accept errors, not as a clear startup failure.
+    if !is_stream_socket(&fd)? {
+        return Ok(None);
+    }
+
+    // sd_listen_fds(3) sets FD_CLOEXEC on every fd it hands out; doing
+    // the same here keeps identical semantics. The fd must not survive
+    // into an exec'd child together with the (now unset) LISTEN_*
+    // variables.
+    set_cloexec(&fd)?;
+
+    // Unset the full marker set, matching sd_listen_fds(unset_environment).
+    // LISTEN_PIDFDID is unset but not compared: matching it against
+    // this process' pidfd inode guards against PID recycling when the
+    // environment was inherited through an intermediary. Socket
+    // activation spawns vdrd directly, so the recycling window does
+    // not apply; the comparison is a follow-up if vdrd ever supports
+    // being re-spawned by something other than the service manager.
+    unset_env(&[
+        b"LISTEN_PID\0",
+        b"LISTEN_FDS\0",
+        b"LISTEN_PIDFDID\0",
+        b"LISTEN_FDNAMES\0",
+    ]);
+
+    // From<OwnedFd> for UnixListener (stable since 1.63); ownership
+    // moves into the listener, which closes the fd on drop.
+    Ok(Some(fd.into()))
 }
 
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        unsafe { libc::umask(self.prev) };
+fn is_stream_socket(fd: &OwnedFd) -> io::Result<bool> {
+    let mut ty: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&ty) as libc::socklen_t;
+    // SAFETY: getsockopt with a correctly sized, writable buffer.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut ty as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ty == libc::SOCK_STREAM)
+}
+
+fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: fcntl(F_SETFD) only touches descriptor flags of a valid fd.
+    let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn unset_env(names: &[&[u8]]) {
+    for name in names {
+        // SAFETY: each slice is a NUL-terminated string literal.
+        unsafe { libc::unsetenv(name.as_ptr().cast()) };
     }
 }
 

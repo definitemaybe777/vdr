@@ -5,13 +5,21 @@
 //
 // Socket mode: @/run/vdr/coredump.sock (simple mode, no request/ack).
 // The @@ request/ack protocol is not implemented.
+//
+// The listening socket is owned by vdrd.socket (systemd socket
+// activation): the service manager creates the socket file at boot
+// and hands the listening fd to this daemon on activation. The
+// socket therefore exists regardless of this daemon's state — a
+// crash is never lost merely because the handler was not running.
+// This daemon takes the fd from the service manager; it never binds
+// the path itself, which would race the manager for the same file.
 
 #![deny(unsafe_code)]
 
 mod ffi;
 
-use std::fs::{self, OpenOptions, Permissions};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,17 +47,31 @@ fn main() -> Result<()> {
 
     let shutdown = register_signals()?;
 
-    create_socket_dir()?;
-    verify_perms(SOCKET_DIR, 0o700, "directory")?;
+    // Refuse to run without a service-manager-provided fd rather than
+    // binding the path: the socket file belongs to vdrd.socket, and a
+    // second bind would conflict with the manager.
+    let listener = match ffi::systemd_listen_fd()? {
+        Some(l) => l,
+        None => bail!(
+            "no listening socket passed by systemd; start vdrd via vdrd.socket, not standalone"
+        ),
+    };
 
-    let listener = bind_socket()?;
+    // The socket directory and file are created by the service manager
+    // (vdrd.socket DirectoryMode/SocketMode). Verification only;
+    // failure means the unit was misconfigured.
+    verify_perms(SOCKET_DIR, 0o700, "directory")?;
     verify_perms(SOCKET_PATH, 0o600, "socket")?;
+
+    listener
+        .set_nonblocking(true)
+        .context("failed to set socket non-blocking")?;
 
     info!(path = SOCKET_PATH, "vdrd listening");
 
     run_accept_loop(&listener, &shutdown);
 
-    cleanup();
+    info!("shutting down");
     Ok(())
 }
 
@@ -103,21 +125,13 @@ fn register_signals() -> Result<Arc<AtomicBool>> {
     Ok(shutdown)
 }
 
-fn create_socket_dir() -> Result<()> {
-    fs::create_dir_all(SOCKET_DIR)
-        .with_context(|| format!("failed to create socket directory {}", SOCKET_DIR))?;
-    fs::set_permissions(SOCKET_DIR, Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to set permissions on {}", SOCKET_DIR))?;
-    Ok(())
-}
-
 /// Verify that a path is owned by root:root with the expected mode.
 ///
-/// This re-stats after `create_socket_dir` / `bind_socket` to confirm
-/// the filesystem actually honored `set_permissions`. It catches:
+/// The socket directory and file are created by the service manager
+/// (vdrd.socket DirectoryMode/SocketMode); this re-stats them to
+/// confirm the filesystem actually honored those settings. It catches:
 /// - filesystems that silently ignore mode changes (some FUSE mounts)
-/// - future regressions if umask or set_permissions is removed
-/// - externally-provided sockets when socket activation is added
+/// - unit regressions if DirectoryMode/SocketMode is loosened
 ///
 /// Not a substitute for credential-based verification: a path-based
 /// stat follows symlinks, so this is sound only when the parent
@@ -139,26 +153,6 @@ fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn bind_socket() -> Result<UnixListener> {
-    let _ = fs::remove_file(SOCKET_PATH);
-
-    // umask 0177 makes bind() create the socket file at 0600,
-    // eliminating the bind → set_permissions race window.
-    // Process-global; restored via Drop on scope exit, including
-    // early return from `?`.
-    let _umask_guard = ffi::UmaskGuard::new(0o177);
-
-    let listener = UnixListener::bind(SOCKET_PATH)
-        .with_context(|| format!("failed to bind socket {}", SOCKET_PATH))?;
-
-    listener
-        .set_nonblocking(true)
-        .context("failed to set socket non-blocking")?;
-    fs::set_permissions(SOCKET_PATH, Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to set permissions on {}", SOCKET_PATH))?;
-    Ok(listener)
 }
 
 fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
@@ -260,9 +254,4 @@ fn read_hostname() -> String {
     fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
-}
-
-fn cleanup() {
-    info!("shutting down");
-    let _ = fs::remove_file(SOCKET_PATH);
 }
