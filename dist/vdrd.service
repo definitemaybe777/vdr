@@ -4,23 +4,23 @@ Documentation=https://github.com/definitemaybe0/vdr
 After=local-fs.target
 ConditionKernelVersion=>=6.16
 
+# The crash socket belongs to vdrd.socket: systemd creates it and keeps it
+# alive regardless of this daemon's state. Waiting for it only orders vdrd
+# start, so crashes never depend on this unit having started.
+Requires=vdrd.socket
+After=vdrd.socket
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/vdrd
-
-# Wait for the socket to appear, then advertise it as core_pattern.
-# nsenter -t 1 -m switches to PID 1's mount namespace because the
-# kernel rejects @-pattern core_pattern writes from non-init mount
-# namespaces (check_coredump_socket() in fs/coredump.c). The +
-# prefix grants root + CAP_SYS_ADMIN for the setns() call.
-ExecStartPost=/bin/sh -c 'until test -S /run/vdr/coredump.sock; do sleep 0.1; done'
-ExecStartPost=+/usr/bin/nsenter -t 1 -m /usr/sbin/sysctl -w kernel.core_pattern=@/run/vdr/coredump.sock
 
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=1
 TimeoutStartSec=10
 
+# core_pattern is applied declaratively from sysctl.d at boot, so this unit
+# performs no runtime kernel writes and needs no cleanup on shutdown.
 # Resource limits
 MemoryMax=256M
 TasksMax=4
