@@ -8,7 +8,10 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use vdr_core::{CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path};
+use clap::error::ErrorKind;
+use vdr_core::{
+    CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path, truncate_for_log,
+};
 
 /// vdr — Voyage Data Recorder
 ///
@@ -134,8 +137,19 @@ fn main() -> anyhow::Result<()> {
                 argv_parse_error: None,
             }
         }
+        // clap models --help/--version as parse "errors" (kinds
+        // DisplayHelp/DisplayVersion): a request to print and exit
+        // with status 0, not a parse failure. exit() follows that
+        // contract — the text goes to stdout (fd 1, /dev/null in
+        // pipe mode) and the process leaves without touching stdin.
+        // Without this arm, a manual `vdr --help` would fall into
+        // the degraded path, block reading stdin as a core dump,
+        // and store an empty core on EOF stdin.
+        Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+            e.exit()
+        }
         Err(e) => {
-            let reason = e.to_string();
+            let reason = sanitize_reason(&e);
             tracing::warn!(error = %reason, "argv parse failed, storing core with degraded metadata");
             degraded_metadata(&reason)
         }
@@ -154,6 +168,43 @@ fn main() -> anyhow::Result<()> {
         tracing::error!(error = ?e, "failed to store core dump");
     }
     Ok(())
+}
+
+/// Byte budget for the sanitized argv parse failure reason.
+///
+/// The reason ends up in both the kmsg warn line and the
+/// "core dump stored" line. The degraded path empties the hostname
+/// field, so even a full-size reason keeps that line well under
+/// kmsg's record limit (992 bytes on kernels before the 2023
+/// printk rework, ~1024 after) — writes over the limit are dropped
+/// with EINVAL, not truncated.
+const REASON_MAX_BYTES: usize = 400;
+
+/// Printable, single-line, bounded rendering of a clap parse
+/// failure, used for the kmsg warn line and the argv_parse_error
+/// metadata field.
+///
+/// clap's rendering is multi-line and echoes the offending argv
+/// value, which can carry attacker-controlled %E/%h content. Raw
+/// rendering fails three ways on the kmsg path: writes over the
+/// record limit are dropped entirely (EINVAL, not truncated),
+/// embedded newlines are split into forged separate records, and
+/// control characters reach terminal emulators reading
+/// dmesg/journalctl output (CWE-117). Quotes and backslashes are
+/// rejected as well, because Debug formatting of the stored field
+/// backslash-escapes them, which would defeat the length budget.
+fn sanitize_reason(e: &clap::Error) -> String {
+    let rendered = e.to_string();
+    let truncated = truncate_for_log(&rendered, REASON_MAX_BYTES);
+    let mut sanitized = String::with_capacity(truncated.len());
+    for ch in truncated.chars() {
+        if (ch.is_ascii_graphic() && ch != '"' && ch != '\\') || ch == ' ' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('?');
+        }
+    }
+    sanitized
 }
 
 /// Metadata for a core dump whose argv could not be parsed (wrong argc

@@ -30,9 +30,11 @@ pub struct CrashMetadata {
 
     /// %u — Real UID.
     ///
-    /// In pipe mode, always Some — provided by kernel argv (%u).
-    /// In socket mode, None if the crashing task was reaped before
-    /// pidfd_info was queried (credentials gone with task_struct).
+    /// In pipe mode, Some when argv parsed successfully, None on
+    /// the degraded path when argv could not be parsed at all (see
+    /// argv_parse_error). In socket mode, None if the crashing task
+    /// was reaped before pidfd_info was queried (credentials gone
+    /// with task_struct).
     pub uid: Option<u32>,
 
     /// %g — Real GID.
@@ -68,7 +70,9 @@ pub struct CrashMetadata {
     /// a misconfigured core_pattern, or unparseable values). None on
     /// every normal path, including socket mode. The core dump itself
     /// is stored regardless; this field records why the surrounding
-    /// metadata is degraded.
+    /// metadata is degraded. The value is single-line, printable,
+    /// and length-bounded: the pipe handler sanitizes it before
+    /// logging to kmsg, which drops oversized writes entirely.
     pub argv_parse_error: Option<String>,
 }
 
@@ -415,8 +419,11 @@ pub(crate) fn parse_executable_build_id(path: &str) -> Option<String> {
 
 /// Truncate a string to max bytes, respecting UTF-8 char boundaries.
 /// Used before logging attacker-controlled strings to /dev/kmsg,
-/// which drops lines exceeding 1024 bytes entirely.
-fn truncate_for_log(s: &str, max: usize) -> &str {
+/// which rejects writes exceeding its record limit with EINVAL — the
+/// entire write is dropped, not truncated. The limit is 992 bytes
+/// (LOG_LINE_MAX) on kernels before the 2023 printk rework, and
+/// ~1024 (PRINTKRB_RECORD_MAX) after.
+pub fn truncate_for_log(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
