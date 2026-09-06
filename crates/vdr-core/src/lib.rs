@@ -63,6 +63,13 @@ pub struct CrashMetadata {
 
     /// %d — Dumpable flag. See CVE-2022-4415.
     pub dumpable: u32,
+
+    /// Reason argv could not be parsed in pipe mode (wrong argc from
+    /// a misconfigured core_pattern, or unparseable values). None on
+    /// every normal path, including socket mode. The core dump itself
+    /// is stored regardless; this field records why the surrounding
+    /// metadata is degraded.
+    pub argv_parse_error: Option<String>,
 }
 
 /// Storage configuration for core dumps.
@@ -264,6 +271,7 @@ pub fn process_core_dump(
           core_limit = metadata.core_limit,
           dumpable = metadata.dumpable,
           hostname = %metadata.hostname,
+          argv_error = ?metadata.argv_parse_error,
           "core dump stored"
     );
 

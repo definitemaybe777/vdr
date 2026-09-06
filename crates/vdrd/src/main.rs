@@ -228,6 +228,7 @@ fn handle_connection(mut stream: UnixStream, addr: SocketAddr) {
         exe_path: resolve_exe_path(info.pid, ""),
         core_limit: 0,
         dumpable: info.dumpable(),
+        argv_parse_error: None,
     };
 
     let storage = StorageConfig::default();

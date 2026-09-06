@@ -2,7 +2,10 @@
 
 mod ffi;
 
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use vdr_core::{CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path};
@@ -33,11 +36,21 @@ struct Args {
     /// %t — Unix timestamp of the crash
     timestamp: u64,
 
+    // A process crashing inside its own UTS namespace can have a
+    // non-UTF-8 hostname; clap's String parsing rejects such argv
+    // with a hard exit, abandoning the core on fd 0 before it is
+    // stored. Raw bytes are kept here; the lossy display conversion
+    // happens when CrashMetadata is built.
     /// %h — Hostname
-    hostname: String,
+    hostname: OsString,
 
+    // Paths may contain non-UTF-8 bytes (argv is arbitrary bytes from
+    // execve); PathBuf keeps them, and the lossy display conversion
+    // happens when CrashMetadata is built — consistent with the
+    // to_string_lossy already applied to /proc/<pid>/exe in
+    // resolve_exe_path().
     /// %E — Path of the executable (slashes replaced with '!' by kernel since Linux 3.0)
-    executable: String,
+    executable: PathBuf,
 
     /// %c — Core file size limit (RLIMIT_CORE).
     /// The kernel ignores this for pipe mode; informational only.
@@ -96,23 +109,36 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "failed to disable core dump; defense-in-depth inactive, kernel sentinel still applies");
     }
 
-    let args = Args::parse();
-
-    // Resolve the real executable path.
-    // %E has '/' replaced with '!' (since Linux 3.0), which is ambiguous.
-    // /proc/<pid>/exe symlink is the kernel-maintained real path.
-    let exe_path = resolve_exe_path(args.pid, &args.executable);
-
-    let metadata = CrashMetadata {
-        pid: args.pid,
-        uid: Some(args.uid),
-        gid: Some(args.gid),
-        signal: args.signal,
-        timestamp: args.timestamp,
-        hostname: args.hostname,
-        exe_path,
-        core_limit: args.core_limit,
-        dumpable: args.dumpable,
+    // clap's parse() prints the error to stderr and exits; stderr is
+    // /dev/null here, and the kernel only checks that exec succeeded
+    // (UMH_WAIT_EXEC), so the exit code is invisible. A hard exit
+    // therefore silently abandons the core waiting on fd 0. The dump
+    // is independent of argv, so parse failures degrade the metadata
+    // instead of discarding it.
+    let metadata = match Args::try_parse() {
+        Ok(args) => {
+            // Resolve the real executable path.
+            // %E has '/' replaced with '!' (since Linux 3.0), which is ambiguous.
+            // /proc/<pid>/exe symlink is the kernel-maintained real path.
+            let exe_path = resolve_exe_path(args.pid, &args.executable.to_string_lossy());
+            CrashMetadata {
+                pid: args.pid,
+                uid: Some(args.uid),
+                gid: Some(args.gid),
+                signal: args.signal,
+                timestamp: args.timestamp,
+                hostname: args.hostname.to_string_lossy().into_owned(),
+                exe_path,
+                core_limit: args.core_limit,
+                dumpable: args.dumpable,
+                argv_parse_error: None,
+            }
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            tracing::warn!(error = %reason, "argv parse failed, storing core with degraded metadata");
+            degraded_metadata(&reason)
+        }
     };
 
     let storage = StorageConfig::default();
@@ -128,4 +154,29 @@ fn main() -> anyhow::Result<()> {
         tracing::error!(error = ?e, "failed to store core dump");
     }
     Ok(())
+}
+
+/// Metadata for a core dump whose argv could not be parsed (wrong argc
+/// from a misconfigured core_pattern, or unparseable values). The dump
+/// on fd 0 is valid regardless of what the kernel wrote into argv, so
+/// it is stored with sentinel values: uid/gid None means unknown
+/// (Some(0) would falsely claim root), pid 0 is never a valid crashing
+/// PID, and the timestamp falls back to the processing time — the same
+/// fallback socket mode uses, as documented on the timestamp field.
+fn degraded_metadata(reason: &str) -> CrashMetadata {
+    CrashMetadata {
+        pid: 0,
+        uid: None,
+        gid: None,
+        signal: 0,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        hostname: String::new(),
+        exe_path: String::new(),
+        core_limit: 0,
+        dumpable: 0,
+        argv_parse_error: Some(reason.to_owned()),
+    }
 }
