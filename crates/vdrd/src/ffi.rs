@@ -181,12 +181,12 @@ pub fn systemd_listen_fd() -> io::Result<Option<UnixListener>> {
     // including the early-return paths below.
     let fd = unsafe { OwnedFd::from_raw_fd(SD_LISTEN_FDS_START) };
 
-    // Reject anything but a stream socket. A datagram listener would
-    // pass activation and then fail confusingly on accept(2); the
-    // service manager passes the same socket again on every restart,
-    // so a unit edited to the wrong Listen* type would otherwise only
-    // surface as accept errors, not as a clear startup failure.
-    if !is_stream_socket(&fd)? {
+    // The service manager passes the same socket on every restart, so
+    // a unit edited to the wrong Listen* directive would otherwise
+    // only surface as confusing per-connection accept errors, not as a
+    // clear startup failure, with the real coredump socket silently
+    // missing in the meantime.
+    if !is_unix_listener(&fd)? {
         return Ok(None);
     }
 
@@ -215,7 +215,24 @@ pub fn systemd_listen_fd() -> io::Result<Option<UnixListener>> {
     Ok(Some(fd.into()))
 }
 
-fn is_stream_socket(fd: &OwnedFd) -> io::Result<bool> {
+/// Whether the fd is a listening AF_UNIX stream socket.
+///
+/// - SO_TYPE: a ListenDatagram socket fails every accept(2) with
+///   EINVAL, one connection at a time.
+/// - SO_ACCEPTCONN: a connected socket (socketpair) fails accept(2)
+///   the same way.
+/// - SO_DOMAIN: SO_PEERPIDFD is implemented for AF_UNIX only, so a
+///   TCP listener from a ListenStream=<port> unit would accept a
+///   connection from any host and then reject it in the peer
+///   verification, making vdrd network-reachable for no benefit.
+///
+/// SO_DOMAIN returns the family the socket was created with, even
+/// unbound, read-only, since Linux 2.6.32 (vdrd requires 6.16+). It is
+/// preferred over the getsockname approach of sd_is_socket_unix(3):
+/// only the family is checked here, so no sockaddr_storage buffer is
+/// needed, and SO_DOMAIN's Linux-only availability is irrelevant
+/// since vdrd targets Linux exclusively.
+fn is_unix_listener(fd: &OwnedFd) -> io::Result<bool> {
     let mut ty: libc::c_int = 0;
     let mut len = std::mem::size_of_val(&ty) as libc::socklen_t;
     // SAFETY: getsockopt with a correctly sized, writable buffer.
@@ -231,7 +248,58 @@ fn is_stream_socket(fd: &OwnedFd) -> io::Result<bool> {
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(ty == libc::SOCK_STREAM)
+    if len as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_TYPE returned unexpected length",
+        ));
+    }
+    if ty != libc::SOCK_STREAM {
+        return Ok(false);
+    }
+
+    let mut listening: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&listening) as libc::socklen_t;
+    // SAFETY: getsockopt with a correctly sized, writable buffer.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            &mut listening as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::c_int>() || listening == 0 {
+        return Ok(false);
+    }
+
+    let mut domain: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&domain) as libc::socklen_t;
+    // SAFETY: getsockopt with a correctly sized, writable buffer.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            &mut domain as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_DOMAIN returned unexpected length",
+        ));
+    }
+
+    Ok(domain == libc::AF_UNIX)
 }
 
 fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
