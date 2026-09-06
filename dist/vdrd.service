@@ -29,8 +29,11 @@ OOMScoreAdjust=500
 # Directories
 StateDirectory=vdr
 StateDirectoryMode=0700
-RuntimeDirectory=vdr
-RuntimeDirectoryMode=0700
+
+# /run/vdr belongs to vdrd.socket (DirectoryMode=0700 creates it at
+# bind time). A RuntimeDirectory here would make systemd delete the
+# directory — and the socket file inside it — every time this
+# service stops, leaving the socket unit listening on an unlinked path.
 
 # Security hardening
 NoNewPrivileges=yes
