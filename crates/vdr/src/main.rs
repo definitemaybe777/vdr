@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use clap::error::ErrorKind;
 use vdr_core::{
     CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path, truncate_for_log,
 };
@@ -22,7 +21,20 @@ use vdr_core::{
 /// Example core_pattern:
 ///   |/usr/bin/vdr %P %u %g %s %t %h %E %c %d
 #[derive(Parser, Debug)]
-#[command(version, about = "Voyage Data Recorder — crash dump handler")]
+// The kernel expands core_pattern specifiers into argv, and %h expands
+// to the crashing process's UTS hostname — settable by any user inside
+// a private user namespace, so argv elements can carry flag-shaped
+// strings. clap's built-in help and version flags turn such an element
+// into a request to exit before stdin is drained, silently discarding
+// the core. Disabling both flags makes those argv values ordinary
+// parse errors, which degrade the metadata instead of discarding the
+// dump. The version attribute stays for package metadata.
+#[command(
+    version,
+    about = "Voyage Data Recorder — crash dump handler",
+    disable_help_flag = true,
+    disable_version_flag = true,
+)]
 struct Args {
     /// %P — PID of the crashed process
     pid: u32,
@@ -136,17 +148,6 @@ fn main() -> anyhow::Result<()> {
                 dumpable: args.dumpable,
                 argv_parse_error: None,
             }
-        }
-        // clap models --help/--version as parse "errors" (kinds
-        // DisplayHelp/DisplayVersion): a request to print and exit
-        // with status 0, not a parse failure. exit() follows that
-        // contract — the text goes to stdout (fd 1, /dev/null in
-        // pipe mode) and the process leaves without touching stdin.
-        // Without this arm, a manual `vdr --help` would fall into
-        // the degraded path, block reading stdin as a core dump,
-        // and store an empty core on EOF stdin.
-        Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
-            e.exit()
         }
         Err(e) => {
             let reason = sanitize_reason(&e);
