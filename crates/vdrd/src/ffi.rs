@@ -180,9 +180,7 @@ pub fn poll(fds: &mut [PollFd]) -> io::Result<usize> {
         // SAFETY: the slice is writable for the duration of the call;
         // poll(2) reads fd/events and writes revents within it and
         // touches nothing else.
-        let ret = unsafe {
-            libc::poll(fds.as_mut_ptr().cast(), fds.len() as libc::nfds_t, -1)
-        };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr().cast(), fds.len() as libc::nfds_t, -1) };
         if ret >= 0 {
             return Ok(ret as usize);
         }
