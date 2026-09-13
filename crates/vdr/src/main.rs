@@ -33,7 +33,7 @@ use vdr_core::{
     version,
     about = "Voyage Data Recorder — crash dump handler",
     disable_help_flag = true,
-    disable_version_flag = true,
+    disable_version_flag = true
 )]
 struct Args {
     /// %P — PID of the crashed process

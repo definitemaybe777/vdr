@@ -47,11 +47,13 @@ pub struct CrashMetadata {
 
     /// %t — Unix timestamp of the crash.
     ///
-    /// In pipe mode, provided by the kernel (%t).
-    /// In socket mode, there is no kernel-provided timestamp;
-    /// vdrd uses SystemTime::now() at processing time. The gap
-    /// is typically <100ms (accept poll interval) but may be
-    /// larger under load.
+    /// System time at connection acceptance, not at crash time. The
+    /// kernel's coredump socket path provides no kernel timestamp, so
+    /// this value is derived from when vdrd's accept(2) returned —
+    /// the point the crashing task first has kernel attention. When
+    /// vdrd is idle the gap is scheduling-scale; during a crash burst
+    /// it includes the time spent queued in the listen backlog. Under
+    /// pipe mode the kernel-provided %t is used instead.
     pub timestamp: u64,
 
     /// %h — Hostname

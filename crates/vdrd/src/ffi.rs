@@ -6,7 +6,7 @@
 
 use std::env;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 // Request flags for pidfd_info.mask (input to PIDFD_GET_INFO).
@@ -136,6 +136,59 @@ pub fn disable_core_dump() -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// A single descriptor watched by poll(2).
+///
+/// The descriptor is observed, not consumed: ownership stays with the
+/// caller for the whole wait. The inner type is libc's own pollfd so
+/// the pointer passed to poll(2) has the exact kernel-expected layout;
+/// repr(transparent) makes the newtype cast to that layout sound.
+#[repr(transparent)]
+pub struct PollFd(libc::pollfd);
+
+impl PollFd {
+    /// Watch a raw descriptor for readability.
+    pub fn readable(fd: RawFd) -> PollFd {
+        PollFd(libc::pollfd {
+            fd,
+            events: libc::POLLIN as libc::c_short,
+            revents: 0,
+        })
+    }
+
+    /// Whether the descriptor became readable.
+    pub fn is_readable(&self) -> bool {
+        (self.0.revents & libc::POLLIN as libc::c_short) != 0
+    }
+}
+
+/// Block until one of the watched descriptors is ready.
+///
+/// No timeout: while idle the daemon has nothing to do, and the point
+/// of this wrapper is to wake exactly when the kernel completes a
+/// connection or a signal handler delivers its byte — never on a
+/// timer.
+///
+/// EINTR is retried inside: a signal-hook pipe handler runs and writes
+/// its byte before the interrupted poll(2) returns, so the retried
+/// call completes immediately instead of leaking the interruption to
+/// the caller.
+pub fn poll(fds: &mut [PollFd]) -> io::Result<usize> {
+    loop {
+        // SAFETY: the slice is writable for the duration of the call;
+        // poll(2) reads fd/events and writes revents within it and
+        // touches nothing else.
+        let ret = unsafe { libc::poll(fds.as_mut_ptr().cast(), fds.len() as libc::nfds_t, -1) };
+        if ret >= 0 {
+            return Ok(ret as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
     }
 }
 

@@ -19,21 +19,19 @@
 mod ffi;
 
 use std::fs::{self, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::flag;
 use tracing::{error, info, warn};
 use vdr_core::{CrashMetadata, StorageConfig, process_core_dump, resolve_exe_path};
 
 const SOCKET_DIR: &str = "/run/vdr";
 const SOCKET_PATH: &str = "/run/vdr/coredump.sock";
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> Result<()> {
     check_kernel_version()?;
@@ -45,7 +43,7 @@ fn main() -> Result<()> {
         warn!(error = %e, "failed to disable core dump for vdrd; recursion protection may be inactive");
     }
 
-    let shutdown = register_signals()?;
+    let signal_pipe = register_signal_pipe()?;
 
     // Refuse to run without a service-manager-provided fd rather than
     // binding the path: the socket file belongs to vdrd.socket, and a
@@ -63,13 +61,9 @@ fn main() -> Result<()> {
     verify_perms(SOCKET_DIR, 0o700, "directory")?;
     verify_perms(SOCKET_PATH, 0o600, "socket")?;
 
-    listener
-        .set_nonblocking(true)
-        .context("failed to set socket non-blocking")?;
-
     info!(path = SOCKET_PATH, "vdrd listening");
 
-    run_accept_loop(&listener, &shutdown);
+    run_accept_loop(&listener, &signal_pipe)?;
 
     info!("shutting down");
     Ok(())
@@ -118,11 +112,26 @@ fn init_logging() {
         .init();
 }
 
-fn register_signals() -> Result<Arc<AtomicBool>> {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    flag::register(SIGTERM, shutdown.clone()).context("failed to register SIGTERM handler")?;
-    flag::register(SIGINT, shutdown.clone()).context("failed to register SIGINT handler")?;
-    Ok(shutdown)
+/// Create the shutdown channel and register it for SIGTERM/SIGINT.
+///
+/// The accept loop blocks in poll(2), so shutdown must arrive as a
+/// readable descriptor rather than as a flag: nothing re-checks a
+/// flag inside a blocked syscall, while a byte on the channel wakes
+/// the poll directly. A socketpair keeps the channel anonymous —
+/// no filesystem path exists that another process could use to send
+/// a spurious shutdown byte.
+fn register_signal_pipe() -> Result<UnixStream> {
+    let (read_end, write_end) = UnixStream::pair().context("failed to create signal pipe")?;
+
+    // Each registration takes ownership of a clone of the write end
+    // and keeps it open until deregistration; the original can drop
+    // here without closing the channel.
+    signal_hook::low_level::pipe::register(SIGTERM, write_end.try_clone()?)
+        .context("failed to register SIGTERM handler")?;
+    signal_hook::low_level::pipe::register(SIGINT, write_end.try_clone()?)
+        .context("failed to register SIGINT handler")?;
+
+    Ok(read_end)
 }
 
 /// Verify that a path is owned by root:root with the expected mode.
@@ -155,18 +164,50 @@ fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_accept_loop(listener: &UnixListener, shutdown: &AtomicBool) {
-    while !shutdown.load(Ordering::Relaxed) {
+/// Accept loop: block until the listener or the shutdown channel is
+/// ready. No timer, so zero wakeups while idle and no latency floor
+/// for a crashing task — poll(2) returns the moment the kernel
+/// completes a connection.
+///
+/// Returns on SIGTERM/SIGINT, or when the listener fails in a way
+/// accept(2) cannot recover from; a dump already in progress is
+/// always allowed to finish first.
+fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<()> {
+    loop {
+        // The shutdown channel comes first so a signal delivered during
+        // a burst of crashes is examined before any pending connection
+        // and cannot be starved by accept traffic.
+        let mut fds = [
+            ffi::PollFd::readable(signal_pipe.as_raw_fd()),
+            ffi::PollFd::readable(listener.as_raw_fd()),
+        ];
+        ffi::poll(&mut fds)?;
+
+        if fds[0].is_readable() {
+            return Ok(());
+        }
+
+        if !fds[1].is_readable() {
+            continue;
+        }
+
         match listener.accept() {
-            Ok((stream, addr)) => {
-                handle_connection(stream, addr);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(POLL_INTERVAL);
-            }
-            Err(ref e) => {
-                error!(error = %e, "accept failed");
-                std::thread::sleep(POLL_INTERVAL);
+            Ok((stream, addr)) => handle_connection(stream, addr),
+            // Spurious readiness (see the spurious-readiness notes under
+            // select(2) BUGS) and a peer that aborted between the wake-up
+            // and accept(2) are transient; wait again.
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted
+                    || e.kind() == std::io::ErrorKind::Interrupted => {}
+            // A persistent error means the listener itself is broken
+            // (for example EBADF after a supervisor mishap). Continuing
+            // would spin and flood the journal, so surface the failure
+            // and let the service manager restart vdrd — the socket
+            // file is owned by vdrd.socket and survives the restart.
+            Err(e) => {
+                error!(error = %e, "accept failed unrecoverably");
+                return Err(e).context("accept failed");
             }
         }
     }
