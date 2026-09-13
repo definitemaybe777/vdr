@@ -180,7 +180,9 @@ pub fn poll(fds: &mut [PollFd]) -> io::Result<usize> {
         // SAFETY: the slice is writable for the duration of the call;
         // poll(2) reads fd/events and writes revents within it and
         // touches nothing else.
-        let ret = unsafe { libc::poll(fds.as_mut_ptr().cast(), fds.len() as libc::nfds_t, -1) };
+        let ret = unsafe {
+            libc::poll(fds.as_mut_ptr().cast(), fds.len() as libc::nfds_t, -1)
+        };
         if ret >= 0 {
             return Ok(ret as usize);
         }
@@ -456,4 +458,60 @@ pub fn pidfd_get_info(pidfd: &OwnedFd) -> io::Result<PidfdInfo> {
     }
 
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn readable_sets_interest_and_clears_revents() {
+        let fd = PollFd::readable(7);
+        assert_eq!(fd.0.fd, 7);
+        assert_eq!(fd.0.events, libc::POLLIN as libc::c_short);
+        // A stale nonzero revents would read as readiness before any
+        // poll(2) call, so construction must zero it.
+        assert_eq!(fd.0.revents, 0);
+    }
+
+    #[test]
+    fn is_readable_distinguishes_data_from_error_bits() {
+        let mut p = PollFd::readable(7);
+
+        // Error-only wake-ups must fall through the accept loop's
+        // "not readable" path, not be mistaken for a connection.
+        p.0.revents = libc::POLLERR as libc::c_short;
+        assert!(!p.is_readable());
+
+        p.0.revents = libc::POLLHUP as libc::c_short;
+        assert!(!p.is_readable());
+
+        p.0.revents = libc::POLLNVAL as libc::c_short;
+        assert!(!p.is_readable());
+
+        p.0.revents = 0;
+        assert!(!p.is_readable());
+
+        // Data wins over an accompanying error: a connection that
+        // arrives with a pending error must still be accepted.
+        p.0.revents = (libc::POLLIN | libc::POLLERR) as libc::c_short;
+        assert!(p.is_readable());
+    }
+
+    #[test]
+    fn poll_blocks_until_data_arrives() {
+        let (read_end, mut write_end) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            // A wrapper that accidentally passed a zero timeout would
+            // return immediately with empty revents and fail the
+            // assertion below; the delay makes that bug observable.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            write_end.write_all(b"x").unwrap();
+        });
+        let mut fds = [PollFd::readable(read_end.as_raw_fd())];
+        poll(&mut fds).unwrap();
+        assert!(fds[0].is_readable());
+        writer.join().unwrap();
+    }
 }
