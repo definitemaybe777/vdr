@@ -1,6 +1,6 @@
 [Unit]
 Description=vdrd coredump socket daemon
-Documentation=https://github.com/definitemaybe0/vdr
+Documentation=https://github.com/definitemaybe777/vdr
 After=local-fs.target
 ConditionKernelVersion=>=6.16
 
@@ -19,11 +19,23 @@ Restart=on-failure
 RestartSec=1
 TimeoutStartSec=10
 
+# vdrd drains up to MAX_CONCURRENT_DUMPS (4) in-flight dumps before
+# exiting. A large core (up to 2 GB) through zstd plus fsync can
+# outlast the default stop timeout of 90 s; being SIGKILLed mid-dump
+# leaves a half-written .core.*.tmp orphan, which vdrd removes on the
+# next startup (see cleanup_stale_temp_files).
+TimeoutStopSec=300
+
 # core_pattern is applied declaratively from sysctl.d at boot, so this unit
 # performs no runtime kernel writes and needs no cleanup on shutdown.
 # Resource limits
 MemoryMax=256M
-TasksMax=4
+
+# pids.max counts every thread: the accept thread plus up to 4 dump
+# workers. At 4 the fourth spawn fails with EAGAIN and that dump is
+# dropped, so leave headroom above 1 + MAX_CONCURRENT_DUMPS.
+TasksMax=8
+
 OOMScoreAdjust=500
 
 # Directories

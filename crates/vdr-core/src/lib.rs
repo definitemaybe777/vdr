@@ -123,6 +123,41 @@ pub struct StoredDump {
     pub comm: Option<String>,
 }
 
+/// Removes orphaned temp files left by a previous vdrd run that was
+/// killed mid-dump (SIGKILL from the service manager bypasses
+/// TempGuard's cleanup, and a half-written temp file can never be
+/// resumed, so it is garbage by definition). TempGuard still owns the
+/// in-process failure paths; this covers only what TempGuard cannot.
+///
+/// Only safe at daemon startup, before any dump can be in progress in
+/// this process: at that point every `.core.*.tmp` in the storage
+/// directory is an orphan from an earlier run. Never call this while
+/// dump workers may be running.
+pub fn cleanup_stale_temp_files(storage: &StorageConfig) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&storage.storage_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        // Temp files are ".<final-name>.tmp" where the final name is
+        // "core.<pid>.<seconds>.<nanos>.zst". Anything else was not
+        // created here and must not be touched.
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with(".core.") && name.ends_with(".tmp")) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(path = %name, error = ?e, "failed to remove stale temp file");
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Process a core dump from any Read source.
 ///
 /// Shared core logic called by both vdr (pipe handler, reads from

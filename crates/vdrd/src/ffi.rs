@@ -162,6 +162,17 @@ impl PollFd {
     pub fn is_readable(&self) -> bool {
         (self.0.revents & libc::POLLIN as libc::c_short) != 0
     }
+
+    /// Whether the last poll reported an error condition on this descriptor.
+    ///
+    /// `POLLERR`, `POLLHUP` and `POLLNVAL` are level-triggered: while the
+    /// condition persists, every poll(2) returns immediately with the bit
+    /// set. A loop that only checks `is_readable()` treats those wake-ups
+    /// as spurious and spins at full CPU, so callers must check this
+    /// separately and act on it.
+    pub fn has_error(&self) -> bool {
+        self.0.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+    }
 }
 
 /// Block until one of the watched descriptors is ready.
@@ -511,5 +522,33 @@ mod tests {
         poll(&mut fds).unwrap();
         assert!(fds[0].is_readable());
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn has_error_detects_error_flags() {
+        let mut p = PollFd(libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        assert!(!p.has_error());
+
+        p = PollFd(libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: libc::POLLERR,
+        });
+        assert!(p.has_error());
+        assert!(!p.is_readable());
+
+        // Data wins over error bits for readability purposes, but the
+        // error is still reported separately.
+        p = PollFd(libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: libc::POLLIN | libc::POLLNVAL,
+        });
+        assert!(p.is_readable());
+        assert!(p.has_error());
     }
 }

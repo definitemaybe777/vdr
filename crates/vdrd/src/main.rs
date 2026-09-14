@@ -18,8 +18,10 @@
 
 mod ffi;
 
+use crate::ffi::PollFd;
+
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
@@ -72,6 +74,16 @@ fn main() -> Result<()> {
     verify_perms(SOCKET_PATH, 0o600, "socket")?;
 
     info!(path = SOCKET_PATH, "vdrd listening");
+
+    // A hard kill (SIGKILL after TimeoutStopSec, or an OOM kill)
+    // leaves half-written temp files behind. No dump can be in
+    // progress yet at this point, so every temp file in the storage
+    // directory is an orphan from a previous run.
+    match vdr_core::cleanup_stale_temp_files(&StorageConfig::default()) {
+        Ok(0) => {}
+        Ok(n) => info!(count = n, "removed stale temp files from previous run"),
+        Err(e) => warn!(error = ?e, "failed to scan storage directory for stale temp files"),
+    }
 
     run_accept_loop(&listener, &signal_pipe)?;
 
@@ -203,18 +215,11 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
         loop {
             let at_capacity = active.load(Ordering::Acquire) >= MAX_CONCURRENT_DUMPS;
 
-            // Shutdown first so a signal during a crash burst is examined
-            // before any pending connection and cannot be starved by
-            // accept traffic.
             let mut fds = [
-                ffi::PollFd::readable(signal_pipe.as_raw_fd()),
-                ffi::PollFd::readable(wake_read.as_raw_fd()),
-                ffi::PollFd::readable(listener.as_raw_fd()),
+                PollFd::readable(signal_pipe.as_raw_fd()),
+                PollFd::readable(wake_read.as_raw_fd()),
+                PollFd::readable(listener.as_raw_fd()),
             ];
-            // At capacity the listener is left out of the wait: a queued
-            // connection would only busy-spin a loop that cannot accept
-            // it. The kernel holds queued connections in the listen
-            // backlog until a completion re-admits the listener.
             let watched = if at_capacity {
                 &mut fds[..2]
             } else {
@@ -229,10 +234,31 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
                 break;
             }
 
+            // POLLERR / POLLHUP / POLLNVAL are level-triggered: poll(2)
+            // returns immediately on every call while the condition
+            // persists, and is_readable() alone ignores them. Without
+            // this check a persistent error on any watched descriptor
+            // becomes a silent busy spin. Every descriptor here is
+            // expected to live as long as the loop, so an error
+            // condition is fatal rather than something to wait out.
+            // fds[2] was not watched while at capacity, but its
+            // revents is zero-initialized each iteration, so checking
+            // it unconditionally is safe.
+            if let Some((source, _)) = [
+                ("signal pipe", fds[0].has_error()),
+                ("worker wake pipe", fds[1].has_error()),
+                ("listener socket", fds[2].has_error()),
+            ]
+            .into_iter()
+            .find(|(_, e)| *e)
+            {
+                fatal = Some(std::io::Error::other(format!(
+                    "poll reported an error condition on the {source}"
+                )));
+                break;
+            }
+
             if fds[1].is_readable() {
-                // Drain completion notifications so stale bytes cannot keep
-                // waking the loop. Content is irrelevant — a byte only
-                // means "re-evaluate capacity".
                 let mut buf = [0u8; 32];
                 loop {
                     match wake_read.read(&mut buf) {
@@ -245,44 +271,58 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
             if !at_capacity && fds[2].is_readable() {
                 match listener.accept() {
                     Ok((stream, addr)) => {
-                        // Counted before the spawn: the worker can finish
-                        // (and release the slot through its guard) before
-                        // this thread reaches the match below, so the slot
-                        // must be accounted for before the thread exists.
-                        active.fetch_add(1, Ordering::Release);
-                        let spawned = wake_write.try_clone().and_then(|wake| {
-                            thread::Builder::new()
-                                .name("vdrd-dump".to_string())
-                                .spawn_scoped(scope, move || {
-                                    let _slot = SlotGuard {
-                                        active: slots,
-                                        wake,
-                                    };
-                                    handle_connection(stream, addr);
-                                })
-                        });
-                        match spawned {
-                            Ok(handle) => workers.push(handle),
-                            // Thread creation failed (memory or thread
-                            // limits). The failed spawn consumed the
-                            // connection when its closure was dropped, so
-                            // the kernel-side writer sees the socket close
-                            // and this crash goes unrecorded. Ownership
-                            // rules leave no way to hand the connection
-                            // back for inline handling; log the loss and
-                            // release the slot.
+                        let wake = match wake_write.try_clone() {
+                            Ok(wake) => wake,
                             Err(e) => {
+                                // The wake-pipe clone exists only so a
+                                // worker thread can signal completion;
+                                // this connection can still be served on
+                                // the accept thread, and the stream has
+                                // not been moved yet. Losing an
+                                // already-accepted dump is the worst
+                                // outcome for a recorder, so degrade to
+                                // serial handling instead of dropping
+                                // it. Blocking here delays further
+                                // accepts and shutdown, same as the
+                                // pre-worker design.
+                                warn!(
+                                    error = %e,
+                                    "failed to clone worker wake pipe; handling connection inline"
+                                );
+                                active.fetch_add(1, Ordering::Release);
+                                handle_connection(stream, addr);
+                                active.fetch_sub(1, Ordering::Release);
+                                continue;
+                            }
+                        };
+                        active.fetch_add(1, Ordering::Release);
+                        match thread::Builder::new()
+                            .name("vdrd-dump".to_string())
+                            .spawn_scoped(scope, move || {
+                                let _slot = SlotGuard {
+                                    active: slots,
+                                    wake,
+                                };
+                                handle_connection(stream, addr);
+                            }) {
+                            Ok(handle) => workers.push(handle),
+                            Err(e) => {
+                                // spawn_scoped consumed the closure, so
+                                // the connection is unrecoverable here:
+                                // the socket closes and the kernel-side
+                                // writer gives up. Only reachable under
+                                // thread-resource exhaustion (ENOMEM or
+                                // pids.max).
                                 error!(error = %e, "dump worker spawn failed; connection dropped");
                                 active.fetch_sub(1, Ordering::Release);
                             }
                         }
                     }
                     Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::ConnectionAborted
-                            || e.kind() == std::io::ErrorKind::Interrupted => {}
+                        if e.kind() == ErrorKind::WouldBlock
+                            || e.kind() == ErrorKind::ConnectionAborted
+                            || e.kind() == ErrorKind::Interrupted => {}
                     Err(e) => {
-                        error!(error = %e, "accept failed unrecoverably");
                         fatal = Some(e);
                         break;
                     }
