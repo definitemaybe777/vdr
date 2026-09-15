@@ -25,6 +25,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -189,12 +190,16 @@ fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
 /// Accept loop: block until the listener, the shutdown channel, or a
 /// worker-completion notification is ready. Each accepted connection is
 /// handled on its own scoped thread, at most MAX_CONCURRENT_DUMPS at a
-/// time; further connections queue in the kernel's listen backlog.
+/// time; further connections queue in the kernel's listen backlog. The
+/// one exception is wake-pipe clone failure: that connection is handled
+/// inline on the accept thread, so an accepted dump is never dropped at
+/// the cost of delaying further accepts and shutdown.
 ///
-/// All exits go through a single drain that joins every worker, so
-/// shutdown and fatal listener errors both let in-flight dumps finish,
-/// and a panicked worker is logged rather than propagated as a scope
-/// panic.
+/// Every exit — shutdown, a fatal accept error, or an error condition
+/// on a watched descriptor — goes through the same drain that joins
+/// every worker, so in-flight dumps finish on all of them, and a
+/// panicked worker or inline handler is logged rather than propagated
+/// as a scope panic.
 fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<()> {
     let active = AtomicUsize::new(0);
     // A move closure captures referenced variables by value, which
@@ -286,13 +291,27 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
                                 // accepts and shutdown, same as the
                                 // pre-worker design.
                                 warn!(
-                                    error = %e,
-                                    "failed to clone worker wake pipe; handling connection inline"
+                                error = %e,
+                                "failed to clone worker wake pipe; handling connection inline"
                                 );
                                 active.fetch_add(1, Ordering::Release);
+                                // This call runs on the accept thread, not inside a worker:
+                                // an uncontained panic would unwind out of the scope closure
+                                // and re-panic after the worker drain, taking the daemon down.
+                                // catch_unwind gives the inline path the same containment the
+                                // join in the drain gives workers. AssertUnwindSafe matches
+                                // what std::thread already guarantees (nothing): the closure
+                                // owns its inputs outright, and the slot counter is only
+                                // touched outside it.
+                                let outcome = catch_unwind(AssertUnwindSafe(move || {
                                 handle_connection(stream, addr);
+                                }));
                                 active.fetch_sub(1, Ordering::Release);
+                                if outcome.is_err() {
+                                error!("inline dump panicked");
+                                }
                                 continue;
+                                }
                             }
                         };
                         active.fetch_add(1, Ordering::Release);
