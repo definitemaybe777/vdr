@@ -344,8 +344,17 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
         // drops its slot guard, and only then sees `closing`; jobs
         // already queued were accepted from the kernel and are still
         // processed during this drain.
-        closing.store(true, Ordering::Release);
-        job_ready.notify_all();
+        //
+        // The store happens under the queue mutex so it cannot slip
+        // between a worker's `closing` check and its `Condvar::wait`
+        // snapshot: landing in that window is exactly how a notify
+        // gets absorbed into the counter value the worker then
+        // sleeps on, losing the wakeup.
+        {
+            let _q = queue_ref.lock().unwrap();
+            closing_ref.store(true, Ordering::Release);
+        }
+        ready_ref.notify_all();
 
         // Single exit path: joining (instead of dropping) the handles
         // keeps a panicked worker from re-panicking the scope after the
