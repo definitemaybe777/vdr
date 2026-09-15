@@ -20,14 +20,15 @@ mod ffi;
 
 use crate::ffi::PollFd;
 
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -188,18 +189,18 @@ fn verify_perms(path: &str, expected: u32, kind: &str) -> Result<()> {
 }
 
 /// Accept loop: block until the listener, the shutdown channel, or a
-/// worker-completion notification is ready. Each accepted connection is
-/// handled on its own scoped thread, at most MAX_CONCURRENT_DUMPS at a
-/// time; further connections queue in the kernel's listen backlog. The
-/// one exception is wake-pipe clone failure: that connection is handled
-/// inline on the accept thread, so an accepted dump is never dropped at
-/// the cost of delaying further accepts and shutdown.
+/// worker-completion notification is ready. Dump workers are spawned
+/// once at startup, so handing off an accepted connection allocates
+/// nothing — no thread creation, no wake-pipe duplication — and an
+/// accepted dump can no longer be lost to resource exhaustion at the
+/// memory peak of a crash storm. At most MAX_CONCURRENT_DUMPS dumps
+/// run at a time; further connections queue in the kernel's listen
+/// backlog.
 ///
 /// Every exit — shutdown, a fatal accept error, or an error condition
-/// on a watched descriptor — goes through the same drain that joins
-/// every worker, so in-flight dumps finish on all of them, and a
-/// panicked worker or inline handler is logged rather than propagated
-/// as a scope panic.
+/// on a watched descriptor — goes through the same drain: queued jobs
+/// are processed, every worker is joined, and a panicked worker is
+/// logged rather than propagated as a scope panic.
 fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<()> {
     let active = AtomicUsize::new(0);
     // A move closure captures referenced variables by value, which
@@ -213,11 +214,52 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
         .set_nonblocking(true)
         .context("failed to set completion pipe non-blocking")?;
 
-    thread::scope(|scope| {
-        let mut workers = Vec::new();
-        let mut fatal = None;
+    // std's mpsc Receiver is !Sync (single consumer), so a shared
+    // channel cannot feed multiple workers; a Mutex+Condvar queue is
+    // the std-only multi-consumer handoff.
+    //
+    // Declared outside the scope closure: workers borrow these until
+    // the scope joins them, which happens after the closure body
+    // returns. Locals of the closure body would not live long
+    // enough (E0597).
+    let queue = Mutex::new(VecDeque::<(UnixStream, SocketAddr)>::new());
+    let job_ready = Condvar::new();
+    let closing = AtomicBool::new(false);
 
-        loop {
+    thread::scope(|scope| {
+        let queue_ref = &queue;
+        let ready_ref = &job_ready;
+        let closing_ref = &closing;
+
+        // Workers are spawned once, before any crash: thread creation
+        // and wake-pipe cloning happen at startup, where failure is a
+        // visible start failure handled by the service manager,
+        // instead of at the memory peak of a crash storm, where
+        // failure loses an accepted dump.
+        let mut workers = Vec::with_capacity(MAX_CONCURRENT_DUMPS);
+        let mut fatal = None;
+        for _ in 0..MAX_CONCURRENT_DUMPS {
+            let wake = match wake_write.try_clone() {
+                Ok(wake) => wake,
+                Err(e) => {
+                    fatal = Some(e);
+                    break;
+                }
+            };
+            match thread::Builder::new()
+                .name("vdrd-dump".to_string())
+                .spawn_scoped(scope, move || {
+                    worker_loop(queue_ref, ready_ref, closing_ref, slots, &wake);
+                }) {
+                Ok(handle) => workers.push(handle),
+                Err(e) => {
+                    fatal = Some(e);
+                    break;
+                }
+            }
+        }
+
+        while fatal.is_none() {
             let at_capacity = active.load(Ordering::Acquire) >= MAX_CONCURRENT_DUMPS;
 
             let mut fds = [
@@ -276,65 +318,14 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
             if !at_capacity && fds[2].is_readable() {
                 match listener.accept() {
                     Ok((stream, addr)) => {
-                        let wake = match wake_write.try_clone() {
-                            Ok(wake) => wake,
-                            Err(e) => {
-                                // The wake-pipe clone exists only so a
-                                // worker thread can signal completion;
-                                // this connection can still be served on
-                                // the accept thread, and the stream has
-                                // not been moved yet. Losing an
-                                // already-accepted dump is the worst
-                                // outcome for a recorder, so degrade to
-                                // serial handling instead of dropping
-                                // it. Blocking here delays further
-                                // accepts and shutdown, same as the
-                                // pre-worker design.
-                                warn!(
-                                error = %e,
-                                "failed to clone worker wake pipe; handling connection inline"
-                                );
-                                active.fetch_add(1, Ordering::Release);
-                                // This call runs on the accept thread, not inside a worker:
-                                // an uncontained panic would unwind out of the scope closure
-                                // and re-panic after the worker drain, taking the daemon down.
-                                // catch_unwind gives the inline path the same containment the
-                                // join in the drain gives workers. AssertUnwindSafe matches
-                                // what std::thread already guarantees (nothing): the closure
-                                // owns its inputs outright, and the slot counter is only
-                                // touched outside it.
-                                let outcome = catch_unwind(AssertUnwindSafe(move || {
-                                    handle_connection(stream, addr);
-                                }));
-                                active.fetch_sub(1, Ordering::Release);
-                                if outcome.is_err() {
-                                    error!("inline dump panicked");
-                                }
-                                continue;
-                            }
-                        };
-                        active.fetch_add(1, Ordering::Release);
-                        match thread::Builder::new()
-                            .name("vdrd-dump".to_string())
-                            .spawn_scoped(scope, move || {
-                                let _slot = SlotGuard {
-                                    active: slots,
-                                    wake,
-                                };
-                                handle_connection(stream, addr);
-                            }) {
-                            Ok(handle) => workers.push(handle),
-                            Err(e) => {
-                                // spawn_scoped consumed the closure, so
-                                // the connection is unrecoverable here:
-                                // the socket closes and the kernel-side
-                                // writer gives up. Only reachable under
-                                // thread-resource exhaustion (ENOMEM or
-                                // pids.max).
-                                error!(error = %e, "dump worker spawn failed; connection dropped");
-                                active.fetch_sub(1, Ordering::Release);
-                            }
-                        }
+                        // Handoff allocates nothing: the worker
+                        // already exists with its stack mapped and
+                        // its wake-pipe clone held, so an accepted
+                        // dump cannot be lost to resource
+                        // exhaustion mid-handoff.
+                        slots.fetch_add(1, Ordering::Release);
+                        queue.lock().unwrap().push_back((stream, addr));
+                        job_ready.notify_one();
                     }
                     Err(ref e)
                         if e.kind() == ErrorKind::WouldBlock
@@ -347,6 +338,14 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
                 }
             }
         }
+
+        // Retire idle workers: they observe `closing` on their next
+        // queue check. A worker mid-dump is unaffected — it finishes,
+        // drops its slot guard, and only then sees `closing`; jobs
+        // already queued were accepted from the kernel and are still
+        // processed during this drain.
+        closing.store(true, Ordering::Release);
+        job_ready.notify_all();
 
         // Single exit path: joining (instead of dropping) the handles
         // keeps a panicked worker from re-panicking the scope after the
@@ -368,7 +367,7 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
 /// Releases a dump slot and notifies the accept loop on drop.
 struct SlotGuard<'a> {
     active: &'a AtomicUsize,
-    wake: UnixStream,
+    wake: &'a UnixStream,
 }
 
 impl Drop for SlotGuard<'_> {
@@ -381,6 +380,51 @@ impl Drop for SlotGuard<'_> {
         // orders of magnitude below the socket's send buffer, so this
         // write cannot fail for lack of space.
         let _ = self.wake.write(&[1]);
+    }
+}
+
+/// Pool worker body: block on the job queue, run one dump per
+/// iteration.
+///
+/// Queue is checked before `closing`: a job already handed off was
+/// accepted from the kernel, so queued jobs are still processed
+/// during shutdown drain. A panicked worker would be a permanent
+/// capacity loss in a fixed pool, so panics are absorbed here
+/// instead of ending the thread.
+fn worker_loop(
+    queue: &Mutex<VecDeque<(UnixStream, SocketAddr)>>,
+    job_ready: &Condvar,
+    closing: &AtomicBool,
+    slots: &AtomicUsize,
+    wake: &UnixStream,
+) {
+    loop {
+        let (stream, addr) = {
+            let mut q = queue.lock().unwrap();
+            loop {
+                match q.pop_front() {
+                    Some(job) => break job,
+                    // Spurious wakeups re-run this check; wait()
+                    // releases the lock while blocked so the accept
+                    // thread can push. The critical section is
+                    // panic-free (pop/check only), so lock
+                    // poisoning is unreachable.
+                    None if closing.load(Ordering::Acquire) => return,
+                    None => q = job_ready.wait(q).unwrap(),
+                }
+            }
+        };
+        let _slot = SlotGuard {
+            active: slots,
+            wake,
+        };
+        if catch_unwind(AssertUnwindSafe(move || {
+            handle_connection(stream, addr);
+        }))
+        .is_err()
+        {
+            error!("dump worker panicked");
+        }
     }
 }
 
@@ -487,7 +531,7 @@ mod tests {
                 .spawn_scoped(scope, move || {
                     let _slot = SlotGuard {
                         active: slots,
-                        wake: wake_write,
+                        wake: &wake_write,
                     };
                     panic!("simulated dump-worker bug");
                 })
