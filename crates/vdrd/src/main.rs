@@ -25,7 +25,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -304,14 +304,13 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
                                 // owns its inputs outright, and the slot counter is only
                                 // touched outside it.
                                 let outcome = catch_unwind(AssertUnwindSafe(move || {
-                                handle_connection(stream, addr);
+                                    handle_connection(stream, addr);
                                 }));
                                 active.fetch_sub(1, Ordering::Release);
                                 if outcome.is_err() {
-                                error!("inline dump panicked");
+                                    error!("inline dump panicked");
                                 }
                                 continue;
-                                }
                             }
                         };
                         active.fetch_add(1, Ordering::Release);
