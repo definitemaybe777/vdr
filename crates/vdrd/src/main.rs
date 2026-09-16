@@ -27,7 +27,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -222,14 +222,20 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
     // the scope joins them, which happens after the closure body
     // returns. Locals of the closure body would not live long
     // enough (E0597).
-    let queue = Mutex::new(VecDeque::<(UnixStream, SocketAddr)>::new());
+    // The accept gate stops admitting connections while MAX_CONCURRENT_DUMPS// slots are outstanding (queued plus in-flight), so `pending` never holds
+    // more than MAX_CONCURRENT_DUMPS jobs.  Reserving that capacity up front
+    // keeps enqueueing an accepted dump allocation-free at the memory peak of
+    // a crash storm; the reservation happens at startup, where a failure is a
+    // visible start failure.
+    let queue = Mutex::new(QueueState {
+    pending: VecDeque::with_capacity(MAX_CONCURRENT_DUMPS),
+    closing: false,
+    });
     let job_ready = Condvar::new();
-    let closing = AtomicBool::new(false);
 
     thread::scope(|scope| {
         let queue_ref = &queue;
         let ready_ref = &job_ready;
-        let closing_ref = &closing;
 
         // Workers are spawned once, before any crash: thread creation
         // and wake-pipe cloning happen at startup, where failure is a
@@ -249,7 +255,7 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
             match thread::Builder::new()
                 .name("vdrd-dump".to_string())
                 .spawn_scoped(scope, move || {
-                    worker_loop(queue_ref, ready_ref, closing_ref, slots, &wake);
+                    worker_loop(queue_ref, ready_ref, slots, &wake);
                 }) {
                 Ok(handle) => workers.push(handle),
                 Err(e) => {
@@ -324,7 +330,7 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
                         // dump cannot be lost to resource
                         // exhaustion mid-handoff.
                         slots.fetch_add(1, Ordering::Release);
-                        queue.lock().unwrap().push_back((stream, addr));
+                        queue.lock().unwrap().pending.push_back((stream, addr));
                         job_ready.notify_one();
                     }
                     Err(ref e)
@@ -339,21 +345,9 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
             }
         }
 
-        // Retire idle workers: they observe `closing` on their next
-        // queue check. A worker mid-dump is unaffected — it finishes,
-        // drops its slot guard, and only then sees `closing`; jobs
-        // already queued were accepted from the kernel and are still
-        // processed during this drain.
-        //
-        // The store happens under the queue mutex so it cannot slip
-        // between a worker's `closing` check and its `Condvar::wait`
-        // snapshot: landing in that window is exactly how a notify
-        // gets absorbed into the counter value the worker then
-        // sleeps on, losing the wakeup.
-        {
-            let _q = queue_ref.lock().unwrap();
-            closing_ref.store(true, Ordering::Release);
-        }
+        // The temporary guard lives until the semicolon, so the write happens
+        // under the queue mutex — the ordering `QueueState` exists to guarantee.
+        queue_ref.lock().unwrap().closing = true;
         ready_ref.notify_all();
 
         // Single exit path: joining (instead of dropping) the handles
@@ -392,6 +386,19 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
+/// Connection handoff state shared by the accept loop and the dump workers.
+///
+/// `closing` lives inside the mutex-guarded state so it is reachable only
+/// while holding the queue lock: a worker decides to sleep on `job_ready`
+/// with that lock held, so a closing write made under the same lock can
+/// never slip between the worker's closing check and its wait.  Keeping
+/// the flag in the struct turns that ordering guarantee into a property
+/// of the type instead of call-site discipline around a bare atomic.
+struct QueueState {
+    pending: VecDeque<(UnixStream, SocketAddr)>,
+    closing: bool,
+}
+
 /// Pool worker body: block on the job queue, run one dump per
 /// iteration.
 ///
@@ -403,23 +410,17 @@ impl Drop for SlotGuard<'_> {
 fn worker_loop(
     queue: &Mutex<VecDeque<(UnixStream, SocketAddr)>>,
     job_ready: &Condvar,
-    closing: &AtomicBool,
     slots: &AtomicUsize,
     wake: &UnixStream,
 ) {
     loop {
         let (stream, addr) = {
-            let mut q = queue.lock().unwrap();
+            let mut state = queue.lock().unwrap();
             loop {
-                match q.pop_front() {
+                match state.pending.pop_front() {
                     Some(job) => break job,
-                    // Spurious wakeups re-run this check; wait()
-                    // releases the lock while blocked so the accept
-                    // thread can push. The critical section is
-                    // panic-free (pop/check only), so lock
-                    // poisoning is unreachable.
-                    None if closing.load(Ordering::Acquire) => return,
-                    None => q = job_ready.wait(q).unwrap(),
+                    None if state.closing => return,
+                    None => state = job_ready.wait(state).unwrap(),
                 }
             }
         };
