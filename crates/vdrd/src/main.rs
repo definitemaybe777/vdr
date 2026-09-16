@@ -228,8 +228,8 @@ fn run_accept_loop(listener: &UnixListener, signal_pipe: &UnixStream) -> Result<
     // a crash storm; the reservation happens at startup, where a failure is a
     // visible start failure.
     let queue = Mutex::new(QueueState {
-    pending: VecDeque::with_capacity(MAX_CONCURRENT_DUMPS),
-    closing: false,
+        pending: VecDeque::with_capacity(MAX_CONCURRENT_DUMPS),
+        closing: false,
     });
     let job_ready = Condvar::new();
 
@@ -408,7 +408,7 @@ struct QueueState {
 /// capacity loss in a fixed pool, so panics are absorbed here
 /// instead of ending the thread.
 fn worker_loop(
-    queue: &Mutex<VecDeque<(UnixStream, SocketAddr)>>,
+    queue: &Mutex<QueueState>,
     job_ready: &Condvar,
     slots: &AtomicUsize,
     wake: &UnixStream,
