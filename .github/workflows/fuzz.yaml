@@ -1,0 +1,86 @@
+name: fuzz
+
+on:
+  # A dev->main PR merge lands on main as a push. Caches saved here
+  # are scoped to main and restorable by later runs, which is what
+  # lets the corpus accumulate; the pull_request closed+merged form
+  # of this trigger scopes every cache to that PR's merge ref, so
+  # the corpus could never persist across runs.
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "libFuzzer -max_total_time per target (seconds)"
+        default: "1800"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Queue merge-triggered runs rather than cancelling them: a
+  # cancelled run loses its corpus contributions.
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # 30 min fuzz + install/build overhead, with headroom for a
+    # manual dispatch at a higher max_total_time.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [build_id]
+    steps:
+      - uses: actions/checkout@v7
+
+      # cargo-fuzz needs nightly for its unstable sanitizer flags; a
+      # dated pin keeps a broken nightly from breaking CI without a
+      # deliberate bump.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-10
+
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        env:
+          # Manual dispatch can override; merge-triggered runs use 30 min.
+          MAX_TOTAL_TIME: ${{ inputs.max_total_time || '1800' }}
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} \
+            fuzz/seeds/${{ matrix.target }} \
+            -- -max_total_time=${MAX_TOTAL_TIME} \
+               -rss_limit_mb=2048 \
+               -timeout=25 \
+               -max_len=65536
+
+      # Compact the corpus before persisting it, or every run's new
+      # units accumulate in the cache until eviction kicks in.
+      - run: cargo fuzz cmin ${{ matrix.target }}
+
+      - uses: actions/cache/save@v6
+        # Bank this round's inputs even when a crash was found: the
+        # crash input lands in the corpus and in the artifact below.
+        if: always()
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

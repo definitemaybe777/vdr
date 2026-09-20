@@ -398,6 +398,43 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
     }
 }
 
+/// Extract the hex-encoded GNU build ID from an in-memory executable
+/// image, returning `None` on any failure.
+///
+/// The parsing chain (ELF headers → `.note.gnu.build-id` section →
+/// note walk) lives in a bytes-level function because every input
+/// reaching it is attacker-controlled: the crashing user chooses the
+/// executable, so any byte of `data` may be hostile and the parser
+/// must stay total — every malformed input is a `None`, never a
+/// panic. elf 0.8 handles untrusted input by returning `ParseError`
+/// instead of panicking; the fuzz target exists to keep that
+/// assumption under mechanical check, so a regression surfaces as a
+/// crash file during fuzzing rather than as a lost core dump in
+/// production.
+#[doc(hidden)]
+pub fn build_id_from_bytes(data: &[u8]) -> Option<String> {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(data).ok()?;
+    let shdr = elf.section_header_by_name(".note.gnu.build-id").ok()??;
+    let mut notes = elf.section_data_as_notes(&shdr).ok()?;
+    notes.find_map(|note| match note {
+        // Matching the variant is the whole filter: GnuBuildId already
+        // implies name "GNU" and type NT_GNU_BUILD_ID.
+        Note::GnuBuildId(NoteGnuBuildId(build_id)) => {
+            // Hand-rolled hex: the hex crate is not a workspace
+            // dependency, and a build ID is ~20 bytes read once per
+            // core dump, so a 16-entry table beats a new dependency.
+            let mut hex = String::with_capacity(build_id.len() * 2);
+            for &b in build_id {
+                hex.push(HEX_DIGITS[(b >> 4) as usize] as char);
+                hex.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
+            }
+            Some(hex)
+        }
+        _ => None,
+    })
+}
+
 /// Parse the executable's ELF header to extract the GNU build ID.
 ///
 /// Core dumps (ET_CORE) do not contain a .note.gnu.build-id section;
@@ -413,45 +450,15 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
 ///
 /// TODO: Use ElfStream instead of reading the entire file into memory.
 pub(crate) fn parse_executable_build_id(path: &str) -> Option<String> {
-    // Open once and fstat the same fd — avoids TOCTOU between stat and read.
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() > MAX_EXE_SIZE {
-        warn!(
-            path = %path,
-            size = metadata.len(),
-              max = MAX_EXE_SIZE,
-              "executable too large, skipping build ID extraction"
-        );
         return None;
     }
-
-    // Defense-in-depth: limit read size even if the file grew between
-    // fstat and read.
+    let file = std::fs::File::open(path).ok()?;
+    let mut file = file.take(MAX_EXE_SIZE + 1);
     let mut data = Vec::new();
-    file.take(MAX_EXE_SIZE + 1).read_to_end(&mut data).ok()?;
-
-    let file = match ElfBytes::<AnyEndian>::minimal_parse(&data) {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(path = %path, error = %e, "failed to parse executable ELF");
-            return None;
-        }
-    };
-
-    file.section_header_by_name(".note.gnu.build-id")
-        .ok()?
-        .and_then(|shdr| file.section_data_as_notes(&shdr).ok())
-        .and_then(|notes| {
-            notes
-                .filter_map(|note| match note {
-                    Note::GnuBuildId(NoteGnuBuildId(id)) => {
-                        Some(id.iter().map(|b| format!("{:02x}", b)).collect())
-                    }
-                    _ => None,
-                })
-                .next()
-        })
+    file.read_to_end(&mut data).ok()?;
+    build_id_from_bytes(&data)
 }
 
 /// Truncate a string to max bytes, respecting UTF-8 char boundaries.
