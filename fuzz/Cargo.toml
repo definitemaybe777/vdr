@@ -1,5 +1,5 @@
 [package]
-name = "vdr-core-fuzz"
+name = "vdr-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -9,15 +9,18 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-
-[dependencies.vdr-core]
-path = ".."
+vdr-core = { path = "../crates/vdr-core" }
 
 [[bin]]
-name = "fuzz_target_1"
-path = "fuzz_targets/fuzz_target_1.rs"
+name = "build_id"
+path = "fuzz_targets/build_id.rs"
 test = false
 doc = false
 bench = false
 
+[profile.release]
+debug = 1
+
+# Empty table detaches this package from the root workspace: fuzz builds
+# need nightly + sanitizer flags that must not leak into normal builds.
 [workspace]
