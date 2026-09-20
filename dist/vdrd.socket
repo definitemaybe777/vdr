@@ -1,0 +1,19 @@
+[Unit]
+Description=vdrd coredump socket
+
+# The kernel only accepts @-style core_pattern sockets whose mount namespace
+# is the init namespace. systemd owns the PID 1 namespace, so handing the
+# socket to systemd keeps it reachable without depending on vdrd's lifecycle.
+# A crash does not then depend on whether the daemon happened to be running.
+
+[Socket]
+ListenStream=/run/vdr/coredump.sock
+SocketMode=0600
+DirectoryMode=0700
+# No leading @ here: in ListenStream it selects an AF_UNIX abstract namespace
+# address, unlike the core_pattern @ that names a filesystem socket. Binding
+# the abstract namespace would leave the kernel connecting to nothing.
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target

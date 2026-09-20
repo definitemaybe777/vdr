@@ -1,39 +1,51 @@
 [Unit]
 Description=vdrd coredump socket daemon
-Documentation=https://github.com/definitemaybe0/vdr
+Documentation=https://github.com/definitemaybe777/vdr
 After=local-fs.target
 ConditionKernelVersion=>=6.16
+
+# The crash socket belongs to vdrd.socket: systemd creates it and keeps it
+# alive regardless of this daemon's state. Waiting for it only orders vdrd
+# start, so crashes never depend on this unit having started.
+Requires=vdrd.socket
+After=vdrd.socket
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/vdrd
-
-# Wait for the socket to appear, then advertise it as core_pattern.
-# nsenter -t 1 -m switches to PID 1's mount namespace because the
-# kernel rejects @-pattern core_pattern writes from non-init mount
-# namespaces (check_coredump_socket() in fs/coredump.c). The +
-# prefix grants root + CAP_SYS_ADMIN for the setns() call.
-ExecStartPost=/bin/sh -c 'until test -S /run/vdr/coredump.sock; do sleep 0.1; done'
-ExecStartPost=+/usr/bin/nsenter -t 1 -m /usr/sbin/sysctl -w kernel.core_pattern=@/run/vdr/coredump.sock
-
-# Reset to kernel default on stop.
-ExecStopPost=+/usr/bin/nsenter -t 1 -m /usr/sbin/sysctl -w kernel.core_pattern=core
 
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=1
 TimeoutStartSec=10
 
+# vdrd drains up to MAX_CONCURRENT_DUMPS (4) in-flight dumps before
+# exiting. A large core (up to 2 GB) through zstd plus fsync can
+# outlast the default stop timeout of 90 s; being SIGKILLed mid-dump
+# leaves a half-written .core.*.tmp orphan, which vdrd removes on the
+# next startup (see cleanup_stale_temp_files).
+TimeoutStopSec=300
+
+# core_pattern is applied declaratively from sysctl.d at boot, so this unit
+# performs no runtime kernel writes and needs no cleanup on shutdown.
 # Resource limits
 MemoryMax=256M
-TasksMax=4
+
+# pids.max counts every thread: the accept thread plus up to 4 dump
+# workers. At 4 the fourth spawn fails with EAGAIN and that dump is
+# dropped, so leave headroom above 1 + MAX_CONCURRENT_DUMPS.
+TasksMax=8
+
 OOMScoreAdjust=500
 
 # Directories
 StateDirectory=vdr
 StateDirectoryMode=0700
-RuntimeDirectory=vdr
-RuntimeDirectoryMode=0700
+
+# /run/vdr belongs to vdrd.socket (DirectoryMode=0700 creates it at
+# bind time). A RuntimeDirectory here would make systemd delete the
+# directory — and the socket file inside it — every time this
+# service stops, leaving the socket unit listening on an unlinked path.
 
 # Security hardening
 NoNewPrivileges=yes

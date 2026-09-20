@@ -1,0 +1,103 @@
+name: fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "libFuzzer -max_total_time per target (seconds)"
+        default: "1800"
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: write   # artifact upload for corpus rotation and crash files
+
+concurrency:
+  # Per-PR group so rapid pushes to dev cancel superseded runs instead
+  # of queueing 30-minute jobs; manual dispatch gets a unique group
+  # and is never cancelled. A cancelled run just does not bank corpus.
+  group: fuzz-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [build_id]
+    steps:
+      # On pull_request events checkout defaults to the PR merge ref:
+      # dev as it would sit on top of current main — exactly the code
+      # that would land. Dispatch runs check out the selected ref.
+      - uses: actions/checkout@v7
+
+      # cargo-fuzz needs nightly for its unstable sanitizer flags; a
+      # dated pin keeps a broken nightly from breaking CI without a
+      # deliberate bump.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-10
+
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+
+      # Corpus rotation through artifacts: actions/cache entries saved
+      # by pull_request-triggered runs are scoped to refs/pull/N/merge
+      # and disappear with the PR, which would reset the corpus every
+      # time a new PR opens. Artifacts survive across PRs; walk back
+      # over recent successful runs until one carries a corpus.
+      - name: Restore corpus
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          for run_id in $(gh run list --workflow "$GITHUB_WORKFLOW" \
+              --status success --limit 10 \
+              --json databaseId --jq '.[].databaseId'); do
+            gh run download "$run_id" \
+              --name "corpus-${{ matrix.target }}" \
+              --dir "fuzz/corpus/${{ matrix.target }}" && break
+          done
+          # No previous run carrying a corpus is normal on the very
+          # first run; an empty corpus is a valid starting point.
+          true
+
+      - name: Fuzz
+        env:
+          # Manual dispatch can override; PR runs use the default.
+          MAX_TOTAL_TIME: ${{ inputs.max_total_time || '1800' }}
+        run: |
+          mkdir -p fuzz/seeds/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} \
+            fuzz/seeds/${{ matrix.target }} \
+            -- -max_total_time=${MAX_TOTAL_TIME} \
+               -rss_limit_mb=2048 \
+               -timeout=25 \
+               -max_len=65536
+
+      # Compact the corpus before persisting it, or every run's new
+      # units accumulate until the artifact grows unbounded.
+      - run: cargo fuzz cmin ${{ matrix.target }}
+
+      # Corpus artifact only on success: it stays last-known-good, so a
+      # crash does not poison later runs; the crash input itself
+      # survives in the crash artifact below.
+      - uses: actions/upload-artifact@v7
+        if: success()
+        with:
+          name: corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          # Corpus rotation depends on this artifact existing; set
+          # explicitly so repo retention settings cannot silently
+          # shorten it below the merge cadence.
+          retention-days: 90
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

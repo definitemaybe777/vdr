@@ -30,9 +30,11 @@ pub struct CrashMetadata {
 
     /// %u — Real UID.
     ///
-    /// In pipe mode, always Some — provided by kernel argv (%u).
-    /// In socket mode, None if the crashing task was reaped before
-    /// pidfd_info was queried (credentials gone with task_struct).
+    /// In pipe mode, Some when argv parsed successfully, None on
+    /// the degraded path when argv could not be parsed at all (see
+    /// argv_parse_error). In socket mode, None if the crashing task
+    /// was reaped before pidfd_info was queried (credentials gone
+    /// with task_struct).
     pub uid: Option<u32>,
 
     /// %g — Real GID.
@@ -45,11 +47,13 @@ pub struct CrashMetadata {
 
     /// %t — Unix timestamp of the crash.
     ///
-    /// In pipe mode, provided by the kernel (%t).
-    /// In socket mode, there is no kernel-provided timestamp;
-    /// vdrd uses SystemTime::now() at processing time. The gap
-    /// is typically <100ms (accept poll interval) but may be
-    /// larger under load.
+    /// System time at connection acceptance, not at crash time. The
+    /// kernel's coredump socket path provides no kernel timestamp, so
+    /// this value is derived from when vdrd's accept(2) returned —
+    /// the point the crashing task first has kernel attention. When
+    /// vdrd is idle the gap is scheduling-scale; during a crash burst
+    /// it includes the time spent queued in the listen backlog. Under
+    /// pipe mode the kernel-provided %t is used instead.
     pub timestamp: u64,
 
     /// %h — Hostname
@@ -63,6 +67,15 @@ pub struct CrashMetadata {
 
     /// %d — Dumpable flag. See CVE-2022-4415.
     pub dumpable: u32,
+
+    /// Reason argv could not be parsed in pipe mode (wrong argc from
+    /// a misconfigured core_pattern, or unparseable values). None on
+    /// every normal path, including socket mode. The core dump itself
+    /// is stored regardless; this field records why the surrounding
+    /// metadata is degraded. The value is single-line, printable,
+    /// and length-bounded: the pipe handler sanitizes it before
+    /// logging to kmsg, which drops oversized writes entirely.
+    pub argv_parse_error: Option<String>,
 }
 
 /// Storage configuration for core dumps.
@@ -108,6 +121,41 @@ pub struct StoredDump {
 
     /// /proc/<pid>/comm contents, if readable
     pub comm: Option<String>,
+}
+
+/// Removes orphaned temp files left by a previous vdrd run that was
+/// killed mid-dump (SIGKILL from the service manager bypasses
+/// TempGuard's cleanup, and a half-written temp file can never be
+/// resumed, so it is garbage by definition). TempGuard still owns the
+/// in-process failure paths; this covers only what TempGuard cannot.
+///
+/// Only safe at daemon startup, before any dump can be in progress in
+/// this process: at that point every `.core.*.tmp` in the storage
+/// directory is an orphan from an earlier run. Never call this while
+/// dump workers may be running.
+pub fn cleanup_stale_temp_files(storage: &StorageConfig) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&storage.storage_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        // Temp files are ".<final-name>.tmp" where the final name is
+        // "core.<pid>.<seconds>.<nanos>.zst". Anything else was not
+        // created here and must not be touched.
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with(".core.") && name.ends_with(".tmp")) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(path = %name, error = ?e, "failed to remove stale temp file");
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Process a core dump from any Read source.
@@ -264,6 +312,7 @@ pub fn process_core_dump(
           core_limit = metadata.core_limit,
           dumpable = metadata.dumpable,
           hostname = %metadata.hostname,
+          argv_error = ?metadata.argv_parse_error,
           "core dump stored"
     );
 
@@ -349,6 +398,43 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
     }
 }
 
+/// Extract the hex-encoded GNU build ID from an in-memory executable
+/// image, returning `None` on any failure.
+///
+/// The parsing chain (ELF headers → `.note.gnu.build-id` section →
+/// note walk) lives in a bytes-level function because every input
+/// reaching it is attacker-controlled: the crashing user chooses the
+/// executable, so any byte of `data` may be hostile and the parser
+/// must stay total — every malformed input is a `None`, never a
+/// panic. elf 0.8 handles untrusted input by returning `ParseError`
+/// instead of panicking; the fuzz target exists to keep that
+/// assumption under mechanical check, so a regression surfaces as a
+/// crash file during fuzzing rather than as a lost core dump in
+/// production.
+#[doc(hidden)]
+pub fn build_id_from_bytes(data: &[u8]) -> Option<String> {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(data).ok()?;
+    let shdr = elf.section_header_by_name(".note.gnu.build-id").ok()??;
+    let mut notes = elf.section_data_as_notes(&shdr).ok()?;
+    notes.find_map(|note| match note {
+        // Matching the variant is the whole filter: GnuBuildId already
+        // implies name "GNU" and type NT_GNU_BUILD_ID.
+        Note::GnuBuildId(NoteGnuBuildId(build_id)) => {
+            // Hand-rolled hex: the hex crate is not a workspace
+            // dependency, and a build ID is ~20 bytes read once per
+            // core dump, so a 16-entry table beats a new dependency.
+            let mut hex = String::with_capacity(build_id.len() * 2);
+            for &b in build_id {
+                hex.push(HEX_DIGITS[(b >> 4) as usize] as char);
+                hex.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
+            }
+            Some(hex)
+        }
+        _ => None,
+    })
+}
+
 /// Parse the executable's ELF header to extract the GNU build ID.
 ///
 /// Core dumps (ET_CORE) do not contain a .note.gnu.build-id section;
@@ -364,51 +450,24 @@ pub(crate) fn read_proc_string(pid: u32, name: &str) -> Option<String> {
 ///
 /// TODO: Use ElfStream instead of reading the entire file into memory.
 pub(crate) fn parse_executable_build_id(path: &str) -> Option<String> {
-    // Open once and fstat the same fd — avoids TOCTOU between stat and read.
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() > MAX_EXE_SIZE {
-        warn!(
-            path = %path,
-            size = metadata.len(),
-              max = MAX_EXE_SIZE,
-              "executable too large, skipping build ID extraction"
-        );
         return None;
     }
-
-    // Defense-in-depth: limit read size even if the file grew between
-    // fstat and read.
+    let file = std::fs::File::open(path).ok()?;
+    let mut file = file.take(MAX_EXE_SIZE + 1);
     let mut data = Vec::new();
-    file.take(MAX_EXE_SIZE + 1).read_to_end(&mut data).ok()?;
-
-    let file = match ElfBytes::<AnyEndian>::minimal_parse(&data) {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(path = %path, error = %e, "failed to parse executable ELF");
-            return None;
-        }
-    };
-
-    file.section_header_by_name(".note.gnu.build-id")
-        .ok()?
-        .and_then(|shdr| file.section_data_as_notes(&shdr).ok())
-        .and_then(|notes| {
-            notes
-                .filter_map(|note| match note {
-                    Note::GnuBuildId(NoteGnuBuildId(id)) => {
-                        Some(id.iter().map(|b| format!("{:02x}", b)).collect())
-                    }
-                    _ => None,
-                })
-                .next()
-        })
+    file.read_to_end(&mut data).ok()?;
+    build_id_from_bytes(&data)
 }
 
 /// Truncate a string to max bytes, respecting UTF-8 char boundaries.
 /// Used before logging attacker-controlled strings to /dev/kmsg,
-/// which drops lines exceeding 1024 bytes entirely.
-fn truncate_for_log(s: &str, max: usize) -> &str {
+/// which rejects writes exceeding its record limit with EINVAL — the
+/// entire write is dropped, not truncated. The limit is 992 bytes
+/// (LOG_LINE_MAX) on kernels before the 2023 printk rework, and
+/// ~1024 (PRINTKRB_RECORD_MAX) after.
+pub fn truncate_for_log(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }

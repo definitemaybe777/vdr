@@ -4,9 +4,10 @@
 
 #![allow(unsafe_code)]
 
+use std::env;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 
 // Request flags for pidfd_info.mask (input to PIDFD_GET_INFO).
 //
@@ -108,10 +109,10 @@ impl PidfdInfo {
 // our 72-byte PidfdInfo so the kernel fills through coredump_signal.
 //
 // Formula: (dir << 30) | (size << 16) | (type << 8) | nr
-//   dir  = 3 (_IOC_READ | _IOC_WRITE)
-//   type = 0xFF (PIDFS_IOCTL_MAGIC)
-//   nr   = 11
-//   size = sizeof(PidfdInfo) = 72
+// dir = 3 (_IOC_READ | _IOC_WRITE)
+// type = 0xFF (PIDFS_IOCTL_MAGIC)
+// nr = 11
+// size = sizeof(PidfdInfo) = 72
 //
 // Expected value: 0xC048FF0B
 const PIDFD_GET_INFO: libc::c_ulong = {
@@ -138,24 +139,246 @@ pub fn disable_core_dump() -> io::Result<()> {
     }
 }
 
-/// RAII guard for the process file-creation mask.
+/// A single descriptor watched by poll(2).
 ///
-/// umask is process-global; the guard restores the previous value
-/// on drop, including on early return via `?` or panic.
-pub struct UmaskGuard {
-    prev: u32,
-}
+/// The descriptor is observed, not consumed: ownership stays with the
+/// caller for the whole wait. The inner type is libc's own pollfd so
+/// the pointer passed to poll(2) has the exact kernel-expected layout;
+/// repr(transparent) makes the newtype cast to that layout sound.
+#[repr(transparent)]
+pub struct PollFd(libc::pollfd);
 
-impl UmaskGuard {
-    pub fn new(mask: u32) -> Self {
-        let prev = unsafe { libc::umask(mask) };
-        Self { prev }
+impl PollFd {
+    /// Watch a raw descriptor for readability.
+    pub fn readable(fd: RawFd) -> PollFd {
+        PollFd(libc::pollfd {
+            fd,
+            events: libc::POLLIN as libc::c_short,
+            revents: 0,
+        })
+    }
+
+    /// Whether the descriptor became readable.
+    pub fn is_readable(&self) -> bool {
+        (self.0.revents & libc::POLLIN as libc::c_short) != 0
+    }
+
+    /// Whether the last poll reported an error condition on this descriptor.
+    ///
+    /// `POLLERR`, `POLLHUP` and `POLLNVAL` are level-triggered: while the
+    /// condition persists, every poll(2) returns immediately with the bit
+    /// set. A loop that only checks `is_readable()` treats those wake-ups
+    /// as spurious and spins at full CPU, so callers must check this
+    /// separately and act on it.
+    pub fn has_error(&self) -> bool {
+        self.0.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
     }
 }
 
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        unsafe { libc::umask(self.prev) };
+/// Block until one of the watched descriptors is ready.
+///
+/// No timeout: while idle the daemon has nothing to do, and the point
+/// of this wrapper is to wake exactly when the kernel completes a
+/// connection or a signal handler delivers its byte — never on a
+/// timer.
+///
+/// EINTR is retried inside: a signal-hook pipe handler runs and writes
+/// its byte before the interrupted poll(2) returns, so the retried
+/// call completes immediately instead of leaking the interruption to
+/// the caller.
+pub fn poll(fds: &mut [PollFd]) -> io::Result<usize> {
+    loop {
+        // SAFETY: the slice is writable for the duration of the call;
+        // poll(2) reads fd/events and writes revents within it and
+        // touches nothing else.
+        let ret = unsafe { libc::poll(fds.as_mut_ptr().cast(), fds.len() as libc::nfds_t, -1) };
+        if ret >= 0 {
+            return Ok(ret as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+// First fd number the socket-activation protocol passes
+// (sd_listen_fds(3): SD_LISTEN_FDS_START).
+const SD_LISTEN_FDS_START: libc::c_int = 3;
+
+/// Take the listening socket the service manager passed via socket
+/// activation.
+///
+/// Implements the sd_listen_fds(3) protocol by hand, so the daemon
+/// carries no sd-daemon dependency. The LISTEN_* variables are plain
+/// environment and are inherited by any child of the service manager,
+/// so they are a trust boundary: every claim is validated against
+/// this process before fd 3 is treated as ours.
+///
+/// Returns Ok(None) when no socket was handed to this process. The
+/// caller must refuse to run in that case; binding the path directly
+/// would race the service manager, which owns the socket file.
+pub fn systemd_listen_fd() -> io::Result<Option<UnixListener>> {
+    // $LISTEN_PID must name this process. Absent, unparsable, or stale
+    // values (set for an earlier process and inherited through an
+    // intermediary) mean fd 3 was not prepared for us.
+    let declared_pid: u32 = match env::var("LISTEN_PID").ok().and_then(|v| v.parse().ok()) {
+        Some(pid) => pid,
+        None => return Ok(None),
+    };
+    if declared_pid != std::process::id() {
+        return Ok(None);
+    }
+
+    // This deployment passes exactly one listener.
+    if env::var("LISTEN_FDS")
+        .ok()
+        .and_then(|v| v.parse::<libc::c_int>().ok())
+        != Some(1)
+    {
+        return Ok(None);
+    }
+
+    // SAFETY: the checks above established that fd 3 was allocated for
+    // this process. Taking it into OwnedFd makes Rust close it on drop,
+    // including the early-return paths below.
+    let fd = unsafe { OwnedFd::from_raw_fd(SD_LISTEN_FDS_START) };
+
+    // The service manager passes the same socket on every restart, so
+    // a unit edited to the wrong Listen* directive would otherwise
+    // only surface as confusing per-connection accept errors, not as a
+    // clear startup failure, with the real coredump socket silently
+    // missing in the meantime.
+    if !is_unix_listener(&fd)? {
+        return Ok(None);
+    }
+
+    // sd_listen_fds(3) sets FD_CLOEXEC on every fd it hands out; doing
+    // the same here keeps identical semantics. The fd must not survive
+    // into an exec'd child together with the (now unset) LISTEN_*
+    // variables.
+    set_cloexec(&fd)?;
+
+    // Unset the full marker set, matching sd_listen_fds(unset_environment).
+    // LISTEN_PIDFDID is unset but not compared: matching it against
+    // this process' pidfd inode guards against PID recycling when the
+    // environment was inherited through an intermediary. Socket
+    // activation spawns vdrd directly, so the recycling window does
+    // not apply; the comparison is a follow-up if vdrd ever supports
+    // being re-spawned by something other than the service manager.
+    unset_env(&[
+        b"LISTEN_PID\0",
+        b"LISTEN_FDS\0",
+        b"LISTEN_PIDFDID\0",
+        b"LISTEN_FDNAMES\0",
+    ]);
+
+    // From<OwnedFd> for UnixListener (stable since 1.63); ownership
+    // moves into the listener, which closes the fd on drop.
+    Ok(Some(fd.into()))
+}
+
+/// Whether the fd is a listening AF_UNIX stream socket.
+///
+/// - SO_TYPE: a ListenDatagram socket fails every accept(2) with
+///   EINVAL, one connection at a time.
+/// - SO_ACCEPTCONN: a connected socket (socketpair) fails accept(2)
+///   the same way.
+/// - SO_DOMAIN: SO_PEERPIDFD is implemented for AF_UNIX only, so a
+///   TCP listener from a ListenStream=<port> unit would accept a
+///   connection from any host and then reject it in the peer
+///   verification, making vdrd network-reachable for no benefit.
+///
+/// SO_DOMAIN returns the family the socket was created with, even
+/// unbound, read-only, since Linux 2.6.32 (vdrd requires 6.16+). It is
+/// preferred over the getsockname approach of sd_is_socket_unix(3):
+/// only the family is checked here, so no sockaddr_storage buffer is
+/// needed, and SO_DOMAIN's Linux-only availability is irrelevant
+/// since vdrd targets Linux exclusively.
+fn is_unix_listener(fd: &OwnedFd) -> io::Result<bool> {
+    let mut ty: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&ty) as libc::socklen_t;
+    // SAFETY: getsockopt with a correctly sized, writable buffer.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut ty as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_TYPE returned unexpected length",
+        ));
+    }
+    if ty != libc::SOCK_STREAM {
+        return Ok(false);
+    }
+
+    let mut listening: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&listening) as libc::socklen_t;
+    // SAFETY: getsockopt with a correctly sized, writable buffer.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            &mut listening as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::c_int>() || listening == 0 {
+        return Ok(false);
+    }
+
+    let mut domain: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&domain) as libc::socklen_t;
+    // SAFETY: getsockopt with a correctly sized, writable buffer.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            &mut domain as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_DOMAIN returned unexpected length",
+        ));
+    }
+
+    Ok(domain == libc::AF_UNIX)
+}
+
+fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: fcntl(F_SETFD) only touches descriptor flags of a valid fd.
+    let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn unset_env(names: &[&[u8]]) {
+    for name in names {
+        // SAFETY: each slice is a NUL-terminated string literal.
+        unsafe { libc::unsetenv(name.as_ptr().cast()) };
     }
 }
 
@@ -244,4 +467,88 @@ pub fn pidfd_get_info(pidfd: &OwnedFd) -> io::Result<PidfdInfo> {
     }
 
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn readable_sets_interest_and_clears_revents() {
+        let fd = PollFd::readable(7);
+        assert_eq!(fd.0.fd, 7);
+        assert_eq!(fd.0.events, libc::POLLIN as libc::c_short);
+        // A stale nonzero revents would read as readiness before any
+        // poll(2) call, so construction must zero it.
+        assert_eq!(fd.0.revents, 0);
+    }
+
+    #[test]
+    fn is_readable_distinguishes_data_from_error_bits() {
+        let mut p = PollFd::readable(7);
+
+        // Error-only wake-ups must fall through the accept loop's
+        // "not readable" path, not be mistaken for a connection.
+        p.0.revents = libc::POLLERR as libc::c_short;
+        assert!(!p.is_readable());
+
+        p.0.revents = libc::POLLHUP as libc::c_short;
+        assert!(!p.is_readable());
+
+        p.0.revents = libc::POLLNVAL as libc::c_short;
+        assert!(!p.is_readable());
+
+        p.0.revents = 0;
+        assert!(!p.is_readable());
+
+        // Data wins over an accompanying error: a connection that
+        // arrives with a pending error must still be accepted.
+        p.0.revents = (libc::POLLIN | libc::POLLERR) as libc::c_short;
+        assert!(p.is_readable());
+    }
+
+    #[test]
+    fn poll_blocks_until_data_arrives() {
+        let (read_end, mut write_end) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            // A wrapper that accidentally passed a zero timeout would
+            // return immediately with empty revents and fail the
+            // assertion below; the delay makes that bug observable.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            write_end.write_all(b"x").unwrap();
+        });
+        let mut fds = [PollFd::readable(read_end.as_raw_fd())];
+        poll(&mut fds).unwrap();
+        assert!(fds[0].is_readable());
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn has_error_detects_error_flags() {
+        let mut p = PollFd(libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        assert!(!p.has_error());
+
+        p = PollFd(libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: libc::POLLERR,
+        });
+        assert!(p.has_error());
+        assert!(!p.is_readable());
+
+        // Data wins over error bits for readability purposes, but the
+        // error is still reported separately.
+        p = PollFd(libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: libc::POLLIN | libc::POLLNVAL,
+        });
+        assert!(p.is_readable());
+        assert!(p.has_error());
+    }
 }
